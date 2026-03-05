@@ -168,17 +168,12 @@ export class AnalyticsService {
       if (!line.trim()) continue;
 
       if (isHeader) {
-        isHeader = false; // Skip the header row
+        isHeader = false;
         continue;
       }
 
       const values = this.parseCSVLine(line);
 
-      // We expect exactly 18 columns based on your format:
-      // 0: id, 1: date, 2: utmSource, 3: utmMedium, 4: utmCampaign, 
-      // 5: sessions, 6: pageviews, 7: users, 8: newUsers, 9: eventCount, 
-      // 10: engagementRate, 11: country, 12: city, 13: deviceCategory, 
-      // 14: userGender, 15: userAge, 16: recurringUsers, 17: identifiedUsers
       if (values.length >= 18) {
         const date = values[1]?.trim();
         const utmSource = values[2]?.trim() || '(direct)';
@@ -198,10 +193,8 @@ export class AnalyticsService {
         const recurringUsers = Number(values[16]) || 0;
         const identifiedUsers = Number(values[17]) || 0;
 
-        // Skip rows where the date is missing
         if (!date) continue;
 
-        // Generate the unique hash required by your DailyAnalytics entity to prevent duplicates
         const rawKey = `${date}|${utmSource}|${utmMedium}|${utmCampaign}|${country}|${city}|${deviceCategory}|${userGender}|${userAge}`;
         const dimensionHash = crypto.createHash('md5').update(rawKey).digest('hex');
 
@@ -226,9 +219,7 @@ export class AnalyticsService {
           engagementRate,
         });
 
-        // Insert in batches of 1500 to keep memory low and DB queries fast
         if (batch.length >= BATCH_SIZE) {
-          // Upsert means it will update existing records if you re-upload the same file, instead of crashing
           await this.analyticsRepo.upsert(batch, ['dimensionHash']);
           totalInserted += batch.length;
           this.logger.log(`Upserted ${totalInserted} legacy records...`);
@@ -237,7 +228,6 @@ export class AnalyticsService {
       }
     }
 
-    // Insert any remaining records that didn't fill the final batch
     if (batch.length > 0) {
       await this.analyticsRepo.upsert(batch, ['dimensionHash']);
       totalInserted += batch.length;
@@ -257,8 +247,9 @@ export class AnalyticsService {
         country, city, device_category, user_gender, user_age,
         sessions, pageviews, users, new_users, recurring_users, identified_users, event_count, engagement_rate
       FROM \`bigquerytest-486307.analytics_266571177.utm_daily_metrics\`
-      WHERE date >= DATE_SUB(CURRENT_DATE('Asia/Kolkata'), INTERVAL 3 DAY)
     `;
+
+      // WHERE date >= DATE_SUB(CURRENT_DATE('Asia/Kolkata'), INTERVAL 3 DAY)
 
     try {
       const stream = await this.bq.queryStream(query);
