@@ -5,7 +5,10 @@ import {
   Query,
   HttpException,
   HttpStatus,
+  UseInterceptors,
+  UploadedFile,
 } from '@nestjs/common';
+import { FileInterceptor } from '@nestjs/platform-express';
 import { AnalyticsService } from './utm-analytics.service';
 
 @Controller('v1/analytics')
@@ -54,9 +57,14 @@ export class AnalyticsController {
   }
 
   @Post('import/legacy')
-  async importLegacyData() {
+  @UseInterceptors(FileInterceptor('file'))
+  async importLegacyData(@UploadedFile() file: Express.Multer.File) {
+    if (!file) {
+      throw new HttpException('No CSV file provided', HttpStatus.BAD_REQUEST);
+    }
+
     try {
-      const count = await this.analyticsService.importLegacyData();
+      const count = await this.analyticsService.importLegacyData(file.buffer);
       return {
         status: 'success',
         message: `Imported ${count} legacy records successfully.`,

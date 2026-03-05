@@ -9,6 +9,7 @@ import * as fs from 'fs';
 import * as path from 'path';
 import * as readline from 'readline';
 import * as crypto from 'crypto';
+import { Readable } from 'stream';
 
 type Rollup = 'daily' | 'weekly' | 'monthly';
 
@@ -149,128 +150,100 @@ export class AnalyticsService {
    * -------------------------------------------------------
    */
 
-  async importLegacyData() {
+  async importLegacyData(fileBuffer: Buffer) {
     this.logger.log('Starting Legacy Data Import via Streams...');
-    const filePath = path.join(process.cwd(), 'legacy_data.csv');
 
-    if (!fs.existsSync(filePath)) {
-      throw new Error('legacy_data.csv not found in project root');
-    }
-
-    const fileStream = fs.createReadStream(filePath);
+    const fileStream = Readable.from(fileBuffer);
     const rl = readline.createInterface({
       input: fileStream,
       crlfDelay: Infinity,
     });
 
-    let lineCount = 0;
-    const dateMap: Record<number, string> = {};
-    const startDate = new Date('2025-11-04');
-    const endDate = new Date('2026-02-08');
-
-    let batch: any[] = [];
-    const BATCH_SIZE = 2000;
+    let isHeader = true;
+    let batch: Partial<DailyAnalytics>[] = [];
+    const BATCH_SIZE = 1500;
     let totalInserted = 0;
 
     for await (const line of rl) {
-      lineCount++;
       if (!line.trim()) continue;
 
-      const values = this.parseCSVLine(line);
-
-      if (lineCount === 2) {
-        values.forEach((val, index) => {
-          if (!val) return;
-          const d = new Date(val);
-          if (!isNaN(d.getTime())) {
-            if (d >= startDate && d <= endDate) {
-              dateMap[index] = format(d, 'yyyy-MM-dd');
-            }
-          }
-        });
-        this.logger.log(
-          `Found ${Object.keys(dateMap).length} relevant date columns.`,
-        );
+      if (isHeader) {
+        isHeader = false; // Skip the header row
         continue;
       }
 
-      if (lineCount <= 2) continue;
+      const values = this.parseCSVLine(line);
 
-      const newUtmLink = values[2];
-      const oldUtmLink = values[3];
-      const link =
-        newUtmLink && newUtmLink.includes('utm_medium')
-          ? newUtmLink
-          : oldUtmLink;
+      // We expect exactly 18 columns based on your format:
+      // 0: id, 1: date, 2: utmSource, 3: utmMedium, 4: utmCampaign, 
+      // 5: sessions, 6: pageviews, 7: users, 8: newUsers, 9: eventCount, 
+      // 10: engagementRate, 11: country, 12: city, 13: deviceCategory, 
+      // 14: userGender, 15: userAge, 16: recurringUsers, 17: identifiedUsers
+      if (values.length >= 18) {
+        const date = values[1]?.trim();
+        const utmSource = values[2]?.trim() || '(direct)';
+        const utmMedium = values[3]?.trim() || '(none)';
+        const utmCampaign = values[4]?.trim() || '(not set)';
+        const sessions = Number(values[5]) || 0;
+        const pageviews = Number(values[6]) || 0;
+        const users = Number(values[7]) || 0;
+        const newUsers = Number(values[8]) || 0;
+        const eventCount = Number(values[9]) || 0;
+        const engagementRate = Number(values[10]) || 0;
+        const country = values[11]?.trim() || 'Unknown';
+        const city = values[12]?.trim() || 'Unknown';
+        const deviceCategory = values[13]?.trim() || 'Unknown';
+        const userGender = values[14]?.trim() || 'Unknown';
+        const userAge = values[15]?.trim() || 'Unknown';
+        const recurringUsers = Number(values[16]) || 0;
+        const identifiedUsers = Number(values[17]) || 0;
 
-      if (!link || !link.includes('utm_source')) continue;
+        // Skip rows where the date is missing
+        if (!date) continue;
 
-      const utmMedium = this.extractParam(link, 'utm_medium');
-      const utmSource = 'fb';
+        // Generate the unique hash required by your DailyAnalytics entity to prevent duplicates
+        const rawKey = `${date}|${utmSource}|${utmMedium}|${utmCampaign}|${country}|${city}|${deviceCategory}|${userGender}|${userAge}`;
+        const dimensionHash = crypto.createHash('md5').update(rawKey).digest('hex');
 
-      if (!utmMedium) continue;
+        batch.push({
+          dimensionHash,
+          date,
+          utmSource,
+          utmMedium,
+          utmCampaign,
+          country,
+          city,
+          deviceCategory,
+          userGender,
+          userAge,
+          sessions,
+          pageviews,
+          users,
+          newUsers,
+          recurringUsers,
+          identifiedUsers,
+          eventCount,
+          engagementRate,
+        });
 
-      for (const [colIndex, dateStr] of Object.entries(dateMap)) {
-        const rawVal = values[Number(colIndex)];
-        const clicks = rawVal ? Number(rawVal.replace(/,/g, '')) : 0;
-
-        if (!isNaN(clicks) && clicks > 0) {
-          batch.push({
-            date: dateStr,
-            utmSource: utmSource,
-            utmMedium: utmMedium,
-            utmCampaign: '(not set)',
-            country: 'Unknown',
-            city: 'Unknown',
-            deviceCategory: 'Unknown',
-            userGender: 'Unknown',
-            userAge: 'Unknown',
-            sessions: clicks,
-            pageviews: clicks,
-            users: clicks,
-            newUsers: 0,
-            recurringUsers: 0,
-            identifiedUsers: 0,
-            eventCount: clicks,
-            engagementRate: 0,
-          });
+        // Insert in batches of 1500 to keep memory low and DB queries fast
+        if (batch.length >= BATCH_SIZE) {
+          // Upsert means it will update existing records if you re-upload the same file, instead of crashing
+          await this.analyticsRepo.upsert(batch, ['dimensionHash']);
+          totalInserted += batch.length;
+          this.logger.log(`Upserted ${totalInserted} legacy records...`);
+          batch = [];
         }
-      }
-
-      if (batch.length >= BATCH_SIZE) {
-        await this.analyticsRepo.upsert(batch, [
-          'date',
-          'utmSource',
-          'utmMedium',
-          'utmCampaign',
-          'country',
-          'city',
-          'deviceCategory',
-          'userGender',
-          'userAge',
-        ]);
-        totalInserted += batch.length;
-        this.logger.log(`Inserted ${totalInserted} legacy records so far...`);
-        batch = [];
       }
     }
 
+    // Insert any remaining records that didn't fill the final batch
     if (batch.length > 0) {
-      await this.analyticsRepo.upsert(batch, [
-        'date',
-        'utmSource',
-        'utmMedium',
-        'utmCampaign',
-        'country',
-        'city',
-        'deviceCategory',
-        'userGender',
-        'userAge',
-      ]);
+      await this.analyticsRepo.upsert(batch, ['dimensionHash']);
       totalInserted += batch.length;
     }
 
-    this.logger.log(`Legacy Import Complete. Total inserted: ${totalInserted}`);
+    this.logger.log(`Legacy Import Complete. Total inserted/updated: ${totalInserted}`);
     return totalInserted;
   }
 
