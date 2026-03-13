@@ -1,7 +1,7 @@
 import { Controller, Post, Body, Res, Get } from '@nestjs/common';
 import type { Response } from 'express';
 import { InjectRepository } from '@nestjs/typeorm';
-import { Repository } from 'typeorm';
+import { Repository, In } from 'typeorm';
 import { InjectQueue } from '@nestjs/bull';
 import type { Queue } from 'bull';
 import { SocialProfile } from '../entities/SocialProfile.entity';
@@ -9,6 +9,7 @@ import { AnalyticsSnapshot } from '../entities/AnalyticsSnapshot.entity';
 import { SocialPost } from '../entities/SocialPost.entity';
 import {
   exchangeForLongLivedToken,
+  fetchLinkedInstagramAccounts,
   fetchPermanentPageTokens,
 } from '../services/meta.service';
 
@@ -33,7 +34,10 @@ export class AuthController {
       const { shortLivedToken } = body;
       const longLivedToken = await exchangeForLongLivedToken(shortLivedToken);
       const pages = await fetchPermanentPageTokens('me', longLivedToken);
-      return res.status(200).json({ pages });
+
+      const igAccounts = await fetchLinkedInstagramAccounts(pages);
+
+      return res.status(200).json({ pages, igAccounts });
     } catch (error: any) {
       console.error('Fetch Pages Error:', error);
       return res.status(500).json({ error: 'Failed to fetch Meta accounts' });
@@ -42,21 +46,40 @@ export class AuthController {
 
   @Post('confirm-pages')
   async confirmPages(
-    @Body() body: { selectedPages: any[] },
+    @Body() body: { selectedPages?: any[]; selectedIgAccounts?: any[] },
     @Res() res: Response,
   ) {
     try {
-      const { selectedPages } = body;
-      const profilePayloads = selectedPages.map((page: any) => ({
-        profileId: page.id,
-        name: page.name,
-        platform: 'facebook',
-        accessToken: page.access_token,
-        isActive: true,
-      }));
+      const { selectedPages = [], selectedIgAccounts = [] } = body;
+
+      const profilePayloads: any[] = [];
+
+      selectedPages.forEach((page: any) => {
+        profilePayloads.push({
+          profileId: page.id,
+          name: page.name,
+          platform: 'facebook',
+          accessToken: page.access_token,
+          isActive: true,
+        });
+      });
+
+      selectedIgAccounts.forEach((ig: any) => {
+        profilePayloads.push({
+          profileId: ig.id,
+          name: ig.name,
+          platform: 'instagram',
+          accessToken: ig.access_token,
+          isActive: true,
+        });
+      });
 
       await this.profileRepo.update(
         { platform: 'facebook' },
+        { isActive: false },
+      );
+      await this.profileRepo.update(
+        { platform: 'instagram' },
         { isActive: false },
       );
 
@@ -96,7 +119,8 @@ export class AuthController {
       }
       return res.status(200).json({
         success: true,
-        message: 'Pages connected successfully. Data sync processed.',
+        message:
+          'Pages and Accounts connected successfully. Data sync processed.',
       });
     } catch (error: any) {
       console.error('Confirm Pages Error:', error);
@@ -106,26 +130,30 @@ export class AuthController {
 
   @Post('disconnect')
   async disconnectMeta(
-    @Body() body: { deleteData: boolean },
+    @Body()
+    body: { deleteData: boolean; platform?: 'facebook' | 'instagram' | 'all' },
     @Res() res: Response,
   ) {
     try {
-      const { deleteData } = body;
-      const fbProfiles = await this.profileRepo.find({
-        where: { platform: 'facebook' },
-      });
-      const fbProfileIds = fbProfiles.map((p) => p.profileId);
+      const { deleteData, platform = 'all' } = body;
 
-      if (fbProfileIds.length > 0) {
+      const platformQuery =
+        platform === 'all' ? In(['facebook', 'instagram']) : platform;
+
+      const profiles = await this.profileRepo.find({
+        where: { platform: platformQuery },
+      });
+      const profileIds = profiles.map((p) => p.profileId);
+
+      if (profileIds.length > 0) {
         const jobs = await this.syncQueue.getJobs([
           'waiting',
           'active',
           'delayed',
           'paused',
         ]);
-
         for (const job of jobs) {
-          if (job.data && fbProfileIds.includes(job.data.profileId)) {
+          if (job.data && profileIds.includes(job.data.profileId)) {
             try {
               await job.remove();
             } catch (err) {}
@@ -134,12 +162,12 @@ export class AuthController {
       }
 
       if (deleteData) {
-        await this.snapshotRepo.delete({ platform: 'facebook' });
-        await this.postRepo.delete({ platform: 'facebook' });
-        await this.profileRepo.delete({ platform: 'facebook' });
+        await this.snapshotRepo.delete({ platform: platformQuery as any });
+        await this.postRepo.delete({ platform: platformQuery as any });
+        await this.profileRepo.delete({ platform: platformQuery as any });
       } else {
         await this.profileRepo.update(
-          { platform: 'facebook' },
+          { platform: platformQuery as any },
           { isActive: false, syncState: 'DISCONNECTED' },
         );
       }
@@ -147,8 +175,8 @@ export class AuthController {
       return res.status(200).json({
         success: true,
         message: deleteData
-          ? 'Successfully disconnected and deleted all Meta data.'
-          : 'Successfully disconnected Meta accounts.',
+          ? `Successfully disconnected and deleted data for ${platform}.`
+          : `Successfully disconnected ${platform} accounts.`,
       });
     } catch (error: any) {
       console.error('Disconnect Meta Error:', error);

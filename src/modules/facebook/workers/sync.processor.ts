@@ -2,14 +2,13 @@ import { Process, Processor } from '@nestjs/bull';
 import type { Job } from 'bull';
 import { InjectRepository } from '@nestjs/typeorm';
 import { Repository } from 'typeorm';
-import axios from 'axios';
 import { SocialProfile } from '../entities/SocialProfile.entity';
-import { SocialPost } from '../entities/SocialPost.entity';
 import { AnalyticsSnapshot } from '../entities/AnalyticsSnapshot.entity';
+import { SocialPost } from '../entities/SocialPost.entity';
 import {
-  fetchPostsPaginated,
-  fetchDailySnapshot,
   fetchProfileBasics,
+  fetchDailySnapshot,
+  fetchPostsPaginated,
   fetchPostDeepInsights,
 } from '../services/meta.service';
 
@@ -18,9 +17,10 @@ export class SyncProcessor {
   constructor(
     @InjectRepository(SocialProfile)
     private profileRepo: Repository<SocialProfile>,
-    @InjectRepository(SocialPost) private postRepo: Repository<SocialPost>,
     @InjectRepository(AnalyticsSnapshot)
     private snapshotRepo: Repository<AnalyticsSnapshot>,
+    @InjectRepository(SocialPost)
+    private postRepo: Repository<SocialPost>,
   ) {}
 
   private sleep(ms: number) {
@@ -28,46 +28,54 @@ export class SyncProcessor {
   }
 
   @Process('initial-historical-sync')
-  async handleInitialSync(
-    job: Job<{ profileId: string; daysToFetch?: number }>,
-  ) {
-    const totalDays = job.data.daysToFetch || 90;
-    console.log(
-      `\n[Worker] Starting historical ${totalDays}-day sync for profile ${job.data.profileId}`,
-    );
-
-    const profile = await this.profileRepo.findOne({
-      where: { profileId: job.data.profileId },
-    });
-    if (!profile) return;
-
-    await this.profileRepo.update(
-      { profileId: profile.profileId },
-      { syncState: 'SYNCING', lastSyncError: '' },
-    );
-
-    const basics = await fetchProfileBasics(
-      profile.profileId,
-      profile.accessToken,
-      profile.platform as any,
-    );
-    const chunkSize = 30;
-    const chunks = Math.ceil(totalDays / chunkSize);
+  async handleHistoricalSync(job: Job) {
+    const { profileId, daysToFetch = 85 } = job.data;
 
     try {
-      for (let i = 0; i < chunks; i++) {
-        const untilDate = new Date();
-        untilDate.setDate(untilDate.getDate() - i * chunkSize);
+      const profile = await this.profileRepo.findOne({
+        where: { profileId, isActive: true },
+      });
 
-        const sinceDate = new Date();
-        sinceDate.setDate(sinceDate.getDate() - (i + 1) * chunkSize);
+      if (!profile) return;
 
-        const sinceUnix = Math.floor(sinceDate.getTime() / 1000);
-        const untilUnix = Math.floor(untilDate.getTime() / 1000);
+      console.log(`\n[Worker] Starting historical ${daysToFetch}-day sync for profile ${profile.profileId}`);
 
-        console.log(
-          `[Worker] Processing chunk ${i + 1}/${chunks} (${sinceDate.toISOString().split('T')[0]} to ${untilDate.toISOString().split('T')[0]})...`,
-        );
+      await this.profileRepo.update(
+        { profileId },
+        { syncState: 'SYNCING', lastSyncError: '' },
+      );
+
+      const basics = await fetchProfileBasics(
+        profile.profileId,
+        profile.accessToken,
+        profile.platform as any,
+      );
+
+      const end = new Date();
+      const start = new Date();
+      start.setDate(start.getDate() - daysToFetch);
+
+      const chunks: any[] = [];
+      let currentStart = new Date(start);
+
+      while (currentStart < end) {
+        let currentEnd = new Date(currentStart);
+        currentEnd.setDate(currentEnd.getDate() + 29);
+        if (currentEnd > end) currentEnd = new Date(end);
+
+        chunks.push({ start: new Date(currentStart), end: new Date(currentEnd) });
+
+        currentStart = new Date(currentEnd);
+        currentStart.setDate(currentStart.getDate() + 1);
+      }
+
+      for (let i = 0; i < chunks.length; i++) {
+        const chunk = chunks[i];
+        
+        console.log(`[Worker] Processing chunk ${i + 1}/${chunks.length} (${chunk.start.toISOString().split('T')[0]} to ${chunk.end.toISOString().split('T')[0]})...`);
+        
+        let sinceUnix = Math.floor(chunk.start.getTime() / 1000);
+        let untilUnix = Math.floor(chunk.end.getTime() / 1000);
 
         const dailyRaw = await fetchDailySnapshot(
           profile.profileId,
@@ -76,224 +84,153 @@ export class SyncProcessor {
           sinceUnix,
           untilUnix,
         );
+
         const dailyDataMap: Record<string, any> = {};
 
         if (Array.isArray(dailyRaw)) {
           dailyRaw.forEach((metric: any) => {
-            metric.values?.forEach((val: any) => {
-              const actualDate = new Date(val.end_time);
-              actualDate.setDate(actualDate.getDate() - 1);
-              const dateStr = actualDate.toISOString().split('T')[0];
+            if (metric.values) {
+              metric.values.forEach((val: any) => {
+                const actualDate = new Date(val.end_time);
+                actualDate.setDate(actualDate.getDate() - 1);
+                const dateStr = actualDate.toISOString().split('T')[0];
+                if (!dailyDataMap[dateStr]) dailyDataMap[dateStr] = {};
+                dailyDataMap[dateStr][metric.name] = val.value;
+              });
+            } else if (metric.total_value) {
+              const dateStr = chunk.start.toISOString().split('T')[0];
               if (!dailyDataMap[dateStr]) dailyDataMap[dateStr] = {};
-              dailyDataMap[dateStr][metric.name] = val.value;
-            });
+              dailyDataMap[dateStr][metric.name] = metric.total_value.value;
+            }
           });
         }
 
         const snapshotPayloads: any[] = [];
-        let fillDate = new Date(sinceDate);
+        let fillDate = new Date(chunk.start);
 
-        while (fillDate <= untilDate) {
+        while (fillDate <= chunk.end) {
           const dateStr = fillDate.toISOString().split('T')[0];
           const metrics = dailyDataMap[dateStr] || {};
+
+          let igGained = 0;
+          let igUnfollows = 0;
+          if (profile.platform === 'instagram' && metrics['follower_count'] !== undefined) {
+            const net = Number(metrics['follower_count']);
+            if (net > 0) igGained = net;
+            if (net < 0) igUnfollows = Math.abs(net);
+          }
 
           snapshotPayloads.push({
             profileId: profile.profileId,
             date: dateStr,
             platform: profile.platform,
             totalFollowers: basics?.followers_count || 0,
-            followersGained:
-              profile.platform === 'facebook'
-                ? metrics['page_daily_follows_unique'] || 0
-                : metrics['follower_count'] || 0,
-            unfollows:
-              profile.platform === 'facebook'
-                ? metrics['page_daily_unfollows_unique'] || 0
-                : 0,
-
-            totalReach:
-              profile.platform === 'facebook'
-                ? metrics['page_impressions_unique'] || 0
-                : metrics['reach'] || 0,
-
-            totalImpressions:
-              profile.platform === 'facebook'
-                ? metrics['page_impressions_unique'] || 0
-                : metrics['impressions'] || 0,
-
-            videoViews:
-              profile.platform === 'facebook'
-                ? metrics['page_video_views'] || 0
-                : 0,
-            totalEngagement:
-              profile.platform === 'facebook'
-                ? metrics['page_post_engagements'] || 0
-                : 0,
-
-            profileClicks:
-              profile.platform === 'facebook'
-                ? metrics['page_total_actions'] || 0
-                : metrics['website_clicks'] || 0,
-            pageViews:
-              profile.platform === 'facebook'
-                ? metrics['page_views_total'] || 0
-                : metrics['profile_views'] || 0,
-            netMessages:
-              profile.platform === 'facebook'
-                ? (metrics['page_messages_new_conversations_unique'] || 0) +
-                  (metrics['page_messages_total_messaging_connections'] || 0)
+            
+            followersGained: profile.platform === 'facebook' ? metrics['page_daily_follows_unique'] || 0 : igGained,
+            unfollows: profile.platform === 'facebook' ? metrics['page_daily_unfollows_unique'] || 0 : igUnfollows,
+            
+            totalReach: profile.platform === 'facebook' ? metrics['page_impressions_unique'] || 0 : metrics['reach'] || 0,
+            totalImpressions: profile.platform === 'facebook' ? metrics['page_impressions_unique'] || 0 : metrics['views'] || metrics['reach'] || 0,
+            videoViews: profile.platform === 'facebook' ? metrics['page_video_views'] || 0 : 0,
+            totalEngagement: profile.platform === 'facebook' ? metrics['page_post_engagements'] || 0 : metrics['total_interactions'] || 0,
+            profileClicks: profile.platform === 'facebook' ? metrics['page_total_actions'] || 0 : metrics['website_clicks'] || 0,
+            pageViews: profile.platform === 'facebook' ? metrics['page_views_total'] || 0 : metrics['profile_views'] || 0,
+            netMessages: profile.platform === 'facebook'
+                ? (metrics['page_messages_new_conversations_unique'] || 0) + (metrics['page_messages_total_messaging_connections'] || 0)
                 : 0,
           });
+
           fillDate.setDate(fillDate.getDate() + 1);
         }
 
         if (snapshotPayloads.length > 0) {
-          await this.snapshotRepo.upsert(snapshotPayloads, [
-            'profileId',
-            'date',
-          ]);
+          await this.snapshotRepo.upsert(snapshotPayloads, ['profileId', 'date']);
+        }
+        if (i < chunks.length - 1) await this.sleep(2000); 
+      }
+
+      console.log(`[Worker] Found ${chunks.length} chunks. Fetching Posts...`);
+
+      const recentPosts = await fetchPostsPaginated(
+        profile.profileId,
+        profile.accessToken,
+        profile.platform as any,
+        start,
+        end,
+      );
+
+      const postPayloads: any[] = [];
+      for (const post of recentPosts) {
+        
+        const rawType = (post.status_type || post.media_type || post.media_product_type || 'UNKNOWN').toLowerCase();
+        let normalizedType = 'text';
+        
+        if (rawType.includes('video') || rawType.includes('reel')) {
+          normalizedType = 'video';
+        } else if (rawType.includes('photo') || rawType.includes('image') || rawType.includes('carousel') || rawType.includes('album')) {
+          normalizedType = 'photo';
         }
 
-        const posts = await fetchPostsPaginated(
-          profile.profileId,
-          profile.accessToken,
-          profile.platform as any,
-          sinceDate,
-          untilDate,
-        );
-        console.log(
-          `[Worker] Found ${posts.length} posts. Fetching deep insights & engagement individually...`,
-        );
-        const postPayloads: any[] = [];
+        let views = 0, reach = 0, clicks = 0, shares = 0;
 
-        for (const post of posts) {
-          let type = post.status_type || post.media_product_type || 'UNKNOWN';
-
-          if (post.is_story) {
-            type = 'story';
-          } else if (profile.platform === 'facebook') {
-            const attType = post.attachments?.data?.[0]?.type;
-            if (!attType) type = 'text';
-            else if (attType === 'share' || attType === 'animated_image_share')
-              type = 'link';
-            else if (attType.includes('video')) type = 'video';
-            else if (attType.includes('photo') || attType === 'album')
-              type = 'photo';
+        try {
+          const deep = await fetchPostDeepInsights(
+            post.id,
+            profile.accessToken,
+            profile.platform as any,
+            rawType,
+          );
+          const getInsight = (arr: any[], name: string) => arr?.find((i: any) => i.name === name)?.values[0]?.value || 0;
+          
+          if (profile.platform === 'facebook') {
+            clicks = getInsight(deep, 'post_clicks');
+            reach = getInsight(deep, 'post_impressions_unique');
+            views = getInsight(deep, 'post_video_views');
+            shares = post.shares?.count || post.shares_count || 0;
           } else {
-            if (post.media_type) type = post.media_type.toLowerCase();
+            reach = getInsight(deep, 'reach');
+            views = getInsight(deep, 'views'); 
+            shares = getInsight(deep, 'shares') || 0;
+            clicks = getInsight(deep, 'saved') || 0; 
           }
+          await this.sleep(200); 
+        } catch (e) {}
 
-          let views = 0,
-            reach = 0,
-            clicks = 0;
-          let likes = 0,
-            comments = 0,
-            shares = 0;
+        postPayloads.push({
+          profileId: profile.profileId,
+          postId: post.id,
+          platform: profile.platform,
+          postType: normalizedType, 
+          message: post.message || post.caption || '',
+          mediaUrl: post.media_url || post.attachments?.data?.[0]?.media?.source || '',
+          thumbnailUrl: post.full_picture || post.picture || post.thumbnail_url || post.media_url || post.attachments?.data?.[0]?.media?.image?.src || '',
+          permalink: post.permalink_url || post.permalink || '',
+          isPublished: post.is_published !== undefined ? post.is_published : true,
+          isBoosted: post.is_eligible_for_promotion === false,
+          authorName: post.from?.name || post.owner?.username || 'Unknown',
+          postedAt: new Date(post.created_time || post.timestamp),
+          likes: post.likes?.summary?.total_count || post.like_count || 0,
+          comments: post.comments?.summary?.total_count || post.comments_count || 0,
+          shares,
+          reach,
+          views,
+          clicks,
+        });
+      }
 
-          try {
-            const deep = await fetchPostDeepInsights(
-              post.id,
-              profile.accessToken,
-              profile.platform as any,
-              type,
-            );
-            const getInsight = (arr: any[], name: string) =>
-              arr?.find((i: any) => i.name === name)?.values[0]?.value || 0;
-
-            if (type === 'story') {
-              if (profile.platform === 'instagram') {
-                reach = getInsight(deep, 'reach');
-                views = getInsight(deep, 'impressions');
-                comments = getInsight(deep, 'replies');
-              } else {
-                reach = getInsight(deep, 'post_impressions_unique');
-              }
-            } else {
-              clicks = getInsight(deep, 'post_clicks');
-              reach = getInsight(
-                deep,
-                profile.platform === 'facebook'
-                  ? 'post_impressions_unique'
-                  : 'reach',
-              );
-              views = getInsight(
-                deep,
-                profile.platform === 'facebook' ? 'post_video_views' : 'plays',
-              );
-            }
-
-            if (profile.platform === 'facebook' && type !== 'story') {
-              const engUrl = `https://graph.facebook.com/v18.0/${post.id}?fields=shares,likes.summary(true),comments.summary(true)&access_token=${profile.accessToken}`;
-              const engRes = await axios.get(engUrl);
-              likes = engRes.data.likes?.summary?.total_count || 0;
-              comments = engRes.data.comments?.summary?.total_count || 0;
-              shares = engRes.data.shares?.count || 0;
-            } else if (profile.platform === 'instagram' && type !== 'story') {
-              likes = post.like_count || 0;
-              comments = post.comments_count || 0;
-              shares = post.shares_count || 0;
-            }
-            await this.sleep(200);
-          } catch (e) {}
-
-          postPayloads.push({
-            profileId: profile.profileId,
-            postId: post.id,
-            platform: profile.platform,
-            postType: type,
-            message: post.message || post.caption || '',
-            mediaUrl:
-              post.media_url ||
-              post.attachments?.data?.[0]?.media?.source ||
-              '',
-            thumbnailUrl:
-              post.full_picture ||
-              post.picture ||
-              post.thumbnail_url ||
-              post.media_url ||
-              post.attachments?.data?.[0]?.media?.image?.src ||
-              '',
-            permalink: post.permalink_url || post.permalink || '',
-            isPublished:
-              post.is_published !== undefined ? post.is_published : true,
-            isBoosted: post.is_eligible_for_promotion === false,
-            authorName: post.from?.name || post.owner?.username || 'Unknown',
-            postedAt: new Date(
-              post.created_time || post.timestamp || new Date(),
-            ),
-            likes,
-            comments,
-            shares,
-            reach,
-            views,
-            clicks,
-          });
-        }
-
-        if (postPayloads.length > 0)
-          await this.postRepo.upsert(postPayloads, ['postId']);
-        console.log(`[Worker] ✅ Chunk ${i + 1} complete!`);
-        if (i < chunks - 1) await this.sleep(2000);
+      if (postPayloads.length > 0) {
+        await this.postRepo.upsert(postPayloads, ['postId']);
       }
 
       await this.profileRepo.update(
-        { profileId: profile.profileId },
-        { syncState: 'COMPLETED' },
+        { profileId },
+        { syncState: 'COMPLETED', lastSyncError: undefined },
       );
-      console.log(
-        `[Worker] Successfully finished ${totalDays}-day historical sync for ${job.data.profileId}.\n`,
-      );
+      console.log(`[Worker] Successfully finished sync for ${job.data.profileId}.\n`);
     } catch (error: any) {
-      console.error(
-        `[Worker] FATAL ERROR: Aborting sync for ${profile.profileId}. Error:`,
-        error.message,
-      );
       await this.profileRepo.update(
-        { profileId: profile.profileId },
-        {
-          syncState: 'FAILED',
-          lastSyncError: error.message,
-        },
+        { profileId },
+        { syncState: 'FAILED', lastSyncError: error.message || 'Worker sync failed' },
       );
     }
   }
