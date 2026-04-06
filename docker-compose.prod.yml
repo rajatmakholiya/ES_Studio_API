@@ -1,0 +1,45 @@
+services:
+  postgres-db:
+    image: postgres:15-alpine
+    container_name: social_postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: ${DB_PASSWORD}
+      POSTGRES_DB: ${DB_NAME:-social_studio_db}
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ['CMD-SHELL', 'pg_isready -U postgres']
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  redis-cache:
+    image: redis:7-alpine
+    container_name: social_redis
+    restart: unless-stopped
+    volumes:
+      - redis_data:/data
+
+  backend:
+    build:
+      context: .
+      dockerfile: DockerFile
+    container_name: social_backend
+    restart: unless-stopped
+    ports:
+      - '5000:5000'
+    env_file:
+      - .env.production
+    volumes:
+      - ./gcp-key.json:/app/gcp-key.json:ro
+    depends_on:
+      postgres-db:
+        condition: service_healthy
+      redis-cache:
+        condition: service_started
+
+volumes:
+  postgres_data:
+  redis_data:
