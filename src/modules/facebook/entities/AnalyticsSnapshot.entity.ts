@@ -44,4 +44,7 @@ export class AnalyticsSnapshot {
 
   @Column({ type: 'int', default: 0 })
   netMessages: number;
+
+  @Column({ type: 'decimal', precision: 10, scale: 2, default: 0 })
+  revenue: number;
 }

@@ -1,4 +1,9 @@
-import { Entity, Column, PrimaryGeneratedColumn, CreateDateColumn } from 'typeorm';
+import {
+  Entity,
+  Column,
+  PrimaryGeneratedColumn,
+  CreateDateColumn,
+} from 'typeorm';
 
 @Entity('users')
 export class User {
@@ -10,7 +15,7 @@ export class User {
 
   @Column()
   passwordHash: string;
-  
+
   @Column({ unique: true, nullable: true })
   apiKey: string;
 

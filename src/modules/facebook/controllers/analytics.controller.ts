@@ -7,11 +7,14 @@ import type { Queue } from 'bull';
 import { SocialProfile } from '../entities/SocialProfile.entity';
 import { AnalyticsSnapshot } from '../entities/AnalyticsSnapshot.entity';
 import { SocialPost } from '../entities/SocialPost.entity';
+import { DemographicSnapshot } from '../entities/DemographicSnapshot.entity';
 import {
   fetchProfileBasics,
   fetchDailySnapshot,
   fetchPostsPaginated,
   fetchPostDeepInsights,
+  fetchDemographics,
+  fetchDailyRevenue,
 } from '../services/meta.service';
 
 @Controller('api/analytics')
@@ -22,6 +25,8 @@ export class AnalyticsController {
     @InjectRepository(AnalyticsSnapshot)
     private snapshotRepo: Repository<AnalyticsSnapshot>,
     @InjectRepository(SocialPost) private postRepo: Repository<SocialPost>,
+    @InjectRepository(DemographicSnapshot)
+    private demographicRepo: Repository<DemographicSnapshot>,
     @InjectQueue('social-sync-queue') private syncQueue: Queue,
   ) {}
 
@@ -32,6 +37,95 @@ export class AnalyticsController {
       select: ['profileId', 'name', 'platform', 'syncState', 'lastSyncError'],
     });
     return res.status(200).json(profiles);
+  }
+
+  @Get('demographics/:profileId')
+  async getDemographics(
+    @Param('profileId') profileId: string,
+    @Res() res: Response,
+  ) {
+    try {
+      const demo = await this.demographicRepo.findOne({
+        where: { profileId },
+        order: { date: 'DESC' },
+      });
+
+      if (!demo) {
+        return res.status(200).json({
+          genderAge: {},
+          topCities: {},
+          topCountries: {},
+        });
+      }
+
+      return res.status(200).json({
+        genderAge: demo.genderAge || {},
+        topCities: demo.topCities || {},
+        topCountries: demo.topCountries || {},
+        date: demo.date,
+        platform: demo.platform,
+      });
+    } catch (error: any) {
+      return res.status(500).json({ error: error.message });
+    }
+  }
+
+  @Post('demographics/aggregate')
+  async getAggregatedDemographics(
+    @Body() body: { profileIds: string[] },
+    @Res() res: Response,
+  ) {
+    try {
+      const { profileIds } = body;
+      if (!profileIds || profileIds.length === 0) {
+        return res.status(200).json({
+          genderAge: {},
+          topCities: {},
+          topCountries: {},
+        });
+      }
+
+      const aggregated = {
+        genderAge: {} as Record<string, number>,
+        topCities: {} as Record<string, number>,
+        topCountries: {} as Record<string, number>,
+      };
+
+      for (const pid of profileIds) {
+        const demo = await this.demographicRepo.findOne({
+          where: { profileId: pid },
+          order: { date: 'DESC' },
+        });
+
+        if (!demo) continue;
+
+        // Aggregate gender/age
+        if (demo.genderAge) {
+          for (const [key, val] of Object.entries(demo.genderAge)) {
+            aggregated.genderAge[key] =
+              (aggregated.genderAge[key] || 0) + Number(val);
+          }
+        }
+        // Aggregate cities
+        if (demo.topCities) {
+          for (const [key, val] of Object.entries(demo.topCities)) {
+            aggregated.topCities[key] =
+              (aggregated.topCities[key] || 0) + Number(val);
+          }
+        }
+        // Aggregate countries
+        if (demo.topCountries) {
+          for (const [key, val] of Object.entries(demo.topCountries)) {
+            aggregated.topCountries[key] =
+              (aggregated.topCountries[key] || 0) + Number(val);
+          }
+        }
+      }
+
+      return res.status(200).json(aggregated);
+    } catch (error: any) {
+      return res.status(500).json({ error: error.message });
+    }
   }
 
   @Get(':profileId/data')
@@ -209,172 +303,16 @@ export class AnalyticsController {
         });
 
         if (existingCount < expectedDays - 2) {
-          try {
-            const basics = await fetchProfileBasics(
-              profile.profileId,
-              profile.accessToken,
-              profile.platform as any,
-            );
-
-            const chunks: any[] = [];
-            let chunkIterStart = new Date(prevStart);
-            
-            while (chunkIterStart < currentEnd) {
-              let chunkIterEnd = new Date(chunkIterStart);
-              chunkIterEnd.setDate(chunkIterEnd.getDate() + 29);
-              if (chunkIterEnd > currentEnd) chunkIterEnd = new Date(currentEnd);
-
-              chunks.push({
-                start: new Date(chunkIterStart),
-                end: new Date(chunkIterEnd),
-              });
-              
-              chunkIterStart = new Date(chunkIterEnd);
-              chunkIterStart.setDate(chunkIterStart.getDate() + 1);
-            }
-
-            for (const chunk of chunks) {
-              let sinceUnix = Math.floor(chunk.start.getTime() / 1000);
-              let untilUnix = Math.floor(chunk.end.getTime() / 1000);
-
-              const dailyRaw = await fetchDailySnapshot(
-                profile.profileId,
-                profile.accessToken,
-                profile.platform as any,
-                sinceUnix,
-                untilUnix,
-              );
-
-              const dailyDataMap: Record<string, any> = {};
-              if (Array.isArray(dailyRaw)) {
-                dailyRaw.forEach((metric: any) => {
-                  if (metric.values) {
-                    metric.values.forEach((val: any) => {
-                      const actualDate = new Date(val.end_time);
-                      actualDate.setDate(actualDate.getDate() - 1);
-                      const dateStr = actualDate.toISOString().split('T')[0];
-                      if (!dailyDataMap[dateStr]) dailyDataMap[dateStr] = {};
-                      dailyDataMap[dateStr][metric.name] = val.value;
-                    });
-                  } else if (metric.total_value) {
-                    const dateStr = chunk.start.toISOString().split('T')[0];
-                    if (!dailyDataMap[dateStr]) dailyDataMap[dateStr] = {};
-                    dailyDataMap[dateStr][metric.name] = metric.total_value.value;
-                  }
-                });
-              }
-
-              const snapshotPayloads: any[] = [];
-              let fillDate = new Date(chunk.start);
-
-              while (fillDate <= chunk.end) {
-                const dateStr = fillDate.toISOString().split('T')[0];
-                const metrics = dailyDataMap[dateStr] || {};
-
-                let igGained = 0;
-                let igUnfollows = 0;
-                if (profile.platform === 'instagram' && metrics['follower_count'] !== undefined) {
-                  const net = Number(metrics['follower_count']);
-                  if (net > 0) igGained = net;
-                  if (net < 0) igUnfollows = Math.abs(net);
-                }
-
-                snapshotPayloads.push({
-                  profileId: profile.profileId,
-                  date: dateStr,
-                  platform: profile.platform,
-                  totalFollowers: basics?.followers_count || 0,
-                  followersGained: profile.platform === 'facebook' ? metrics['page_daily_follows_unique'] || 0 : igGained,
-                  unfollows: profile.platform === 'facebook' ? metrics['page_daily_unfollows_unique'] || 0 : igUnfollows,
-                  totalReach: profile.platform === 'facebook' ? metrics['page_impressions_unique'] || 0 : metrics['reach'] || 0,
-                  totalImpressions: profile.platform === 'facebook' ? metrics['page_impressions_unique'] || 0 : metrics['views'] || metrics['reach'] || 0,
-                  videoViews: profile.platform === 'facebook' ? metrics['page_video_views'] || 0 : 0,
-                  totalEngagement: profile.platform === 'facebook' ? metrics['page_post_engagements'] || 0 : metrics['total_interactions'] || 0,
-                  profileClicks: profile.platform === 'facebook' ? metrics['page_total_actions'] || 0 : metrics['website_clicks'] || 0,
-                  pageViews: profile.platform === 'facebook' ? metrics['page_views_total'] || 0 : metrics['profile_views'] || 0,
-                  netMessages: profile.platform === 'facebook'
-                      ? (metrics['page_messages_new_conversations_unique'] || 0) + (metrics['page_messages_total_messaging_connections'] || 0)
-                      : 0,
-                });
-                fillDate.setDate(fillDate.getDate() + 1);
-              }
-
-              if (snapshotPayloads.length > 0) {
-                await this.snapshotRepo.upsert(snapshotPayloads, ['profileId', 'date']);
-              }
-            }
-
-            const recentPosts = await fetchPostsPaginated(
-              profile.profileId,
-              profile.accessToken,
-              profile.platform as any,
-              prevStart,
-              currentEnd,
-            );
-            const postPayloads: any[] = [];
-
-            for (const post of recentPosts) {
-              const rawType = (post.status_type || post.media_type || post.media_product_type || 'UNKNOWN').toLowerCase();
-              let normalizedType = 'text';
-              if (rawType.includes('video') || rawType.includes('reel')) {
-                normalizedType = 'video';
-              } else if (rawType.includes('photo') || rawType.includes('image') || rawType.includes('carousel') || rawType.includes('album')) {
-                normalizedType = 'photo';
-              }
-
-              let views = 0, reach = 0, clicks = 0, shares = 0;
-
-              try {
-                const deep = await fetchPostDeepInsights(
-                  post.id,
-                  profile.accessToken,
-                  profile.platform as any,
-                  rawType,
-                );
-                const getInsight = (arr: any[], name: string) => arr?.find((i: any) => i.name === name)?.values[0]?.value || 0;
-                
-                if (profile.platform === 'facebook') {
-                  clicks = getInsight(deep, 'post_clicks');
-                  reach = getInsight(deep, 'post_impressions_unique');
-                  views = getInsight(deep, 'post_video_views');
-                  shares = post.shares?.count || post.shares_count || 0;
-                } else {
-                  reach = getInsight(deep, 'reach');
-                  views = getInsight(deep, 'views'); 
-                  shares = getInsight(deep, 'shares') || 0;
-                  clicks = getInsight(deep, 'saved') || 0; 
-                }
-              } catch (e) {}
-
-              postPayloads.push({
-                profileId: profile.profileId,
-                postId: post.id,
-                platform: profile.platform,
-                postType: normalizedType,
-                message: post.message || post.caption || '',
-                mediaUrl: post.media_url || post.attachments?.data?.[0]?.media?.source || '',
-                thumbnailUrl: post.full_picture || post.picture || post.thumbnail_url || post.media_url || post.attachments?.data?.[0]?.media?.image?.src || '',
-                permalink: post.permalink_url || post.permalink || '',
-                isPublished: post.is_published !== undefined ? post.is_published : true,
-                isBoosted: post.is_eligible_for_promotion === false,
-                authorName: post.from?.name || post.owner?.username || 'Unknown',
-                postedAt: new Date(post.created_time || post.timestamp),
-                likes: post.likes?.summary?.total_count || post.like_count || 0,
-                comments: post.comments?.summary?.total_count || post.comments_count || 0,
-                shares,
-                reach,
-                views,
-                clicks,
-              });
-            }
-            if (postPayloads.length > 0)
-              await this.postRepo.upsert(postPayloads, ['postId']);
-
-          } catch (err: any) {
+          // Instead of a heavy blocking sync inline, offload to background
+          if (profile.syncState !== 'SYNCING') {
             await this.profileRepo.update(
               { profileId: profile.profileId },
-              { syncState: 'FAILED', lastSyncError: err.message },
+              { syncState: 'SYNCING' },
             );
+            await this.syncQueue.add('initial-historical-sync', {
+              profileId: profile.profileId,
+              daysToFetch: expectedDays,
+            });
           }
         }
       }
@@ -405,15 +343,21 @@ export class AnalyticsController {
       });
 
       const currentPosts = await this.postRepo.find({
-        where: { profileId: In(profileIds), postedAt: Between(currentStart, currentEnd) },
+        where: {
+          profileId: In(profileIds),
+          postedAt: Between(currentStart, currentEnd),
+        },
       });
       const prevPosts = await this.postRepo.find({
-        where: { profileId: In(profileIds), postedAt: Between(prevStart, currentStart) },
+        where: {
+          profileId: In(profileIds),
+          postedAt: Between(prevStart, currentStart),
+        },
       });
 
       const timeSeriesMap: Record<string, any> = {};
       let dIter = new Date(currentStart);
-      
+
       while (dIter <= currentEnd) {
         const dStr = dIter.toISOString().split('T')[0];
         timeSeriesMap[dStr] = {
@@ -428,6 +372,7 @@ export class AnalyticsController {
           messages: 0,
           videoViews: 0,
           engagementRate: 0,
+          revenue: 0,
         };
         dIter.setDate(dIter.getDate() + 1);
       }
@@ -437,11 +382,15 @@ export class AnalyticsController {
         if (timeSeriesMap[d]) {
           timeSeriesMap[d].followersGained += Number(snap.followersGained || 0);
           timeSeriesMap[d].unfollows += Number(snap.unfollows || 0);
-          timeSeriesMap[d].netFollowers += Number(snap.followersGained || 0) - Number(snap.unfollows || 0);
-          timeSeriesMap[d].impressions += Number(snap.totalImpressions || snap.totalReach || 0);
+          timeSeriesMap[d].netFollowers +=
+            Number(snap.followersGained || 0) - Number(snap.unfollows || 0);
+          timeSeriesMap[d].impressions += Number(
+            snap.totalImpressions || snap.totalReach || 0,
+          );
           timeSeriesMap[d].engagements += Number(snap.totalEngagement || 0);
           timeSeriesMap[d].pageViews += Number(snap.pageViews || 0);
           timeSeriesMap[d].messages += Number(snap.netMessages || 0);
+          timeSeriesMap[d].revenue += Number(snap.revenue || 0);
 
           if (snap.platform === 'facebook') {
             timeSeriesMap[d].videoViews += Number(snap.videoViews || 0);
@@ -452,12 +401,17 @@ export class AnalyticsController {
       currentPosts.forEach((post) => {
         const postDateStr = new Date(post.postedAt).toISOString().split('T')[0];
         if (timeSeriesMap[postDateStr]) {
-          const postEngagements = Number(post.likes || 0) + Number(post.comments || 0) + Number(post.shares || 0) + Number(post.clicks || 0);
+          const postEngagements =
+            Number(post.likes || 0) +
+            Number(post.comments || 0) +
+            Number(post.shares || 0) +
+            Number(post.clicks || 0);
           timeSeriesMap[postDateStr].engagements += postEngagements;
-          
+
           if (post.platform === 'instagram') {
             timeSeriesMap[postDateStr].videoViews += Number(post.views || 0);
-            timeSeriesMap[postDateStr].impressions += Number(post.views || 0) + Number(post.reach || 0);
+            timeSeriesMap[postDateStr].impressions +=
+              Number(post.views || 0) + Number(post.reach || 0);
           } else if (post.platform === 'facebook') {
             timeSeriesMap[postDateStr].impressions += Number(post.reach || 0);
           }
@@ -465,7 +419,8 @@ export class AnalyticsController {
       });
 
       const timeSeries = Object.values(timeSeriesMap).sort(
-        (a: any, b: any) => new Date(a.date).getTime() - new Date(b.date).getTime(),
+        (a: any, b: any) =>
+          new Date(a.date).getTime() - new Date(b.date).getTime(),
       );
 
       const latestFollowers: Record<string, number> = {};
@@ -474,13 +429,19 @@ export class AnalyticsController {
           where: { profileId: pid, date: LessThan(currentStartStr) },
           order: { date: 'DESC' },
         });
-        latestFollowers[pid] = priorSnap && priorSnap.totalFollowers > 0 ? priorSnap.totalFollowers : 0;
+        latestFollowers[pid] =
+          priorSnap && priorSnap.totalFollowers > 0
+            ? priorSnap.totalFollowers
+            : 0;
       }
 
       timeSeries.forEach((day) => {
-        const daySnaps = currentSnapshots.filter((s) => normalizeDate(s.date) === day.date);
+        const daySnaps = currentSnapshots.filter(
+          (s) => normalizeDate(s.date) === day.date,
+        );
         daySnaps.forEach((s) => {
-          if (s.totalFollowers > 0) latestFollowers[s.profileId] = s.totalFollowers;
+          if (s.totalFollowers > 0)
+            latestFollowers[s.profileId] = s.totalFollowers;
         });
 
         let dailyAudience = 0;
@@ -488,8 +449,11 @@ export class AnalyticsController {
           dailyAudience += latestFollowers[pid] || 0;
         });
         day.totalAudience = dailyAudience;
-        
-        day.engagementRate = day.impressions > 0 ? Number(((day.engagements / day.impressions) * 100).toFixed(1)) : 0;
+
+        day.engagementRate =
+          day.impressions > 0
+            ? Number(((day.engagements / day.impressions) * 100).toFixed(1))
+            : 0;
       });
 
       let currentAudience = 0;
@@ -503,35 +467,90 @@ export class AnalyticsController {
         }
       }
 
-      const currentNetGrowth = timeSeries.reduce((sum, s) => sum + Number(s.netFollowers || 0), 0);
-      const currentImpressions = timeSeries.reduce((sum, s) => sum + Number(s.impressions || 0), 0);
-      const currentVideoViews = timeSeries.reduce((sum, s) => sum + Number(s.videoViews || 0), 0);
-      const currentEngagements = timeSeries.reduce((sum, s) => sum + Number(s.engagements || 0), 0);
-      const currentPageViews = timeSeries.reduce((sum, s) => sum + Number(s.pageViews || 0), 0);
-      const currentMessages = timeSeries.reduce((sum, s) => sum + Number(s.messages || 0), 0);
-      
-      const currentEngRate = currentImpressions > 0 ? (currentEngagements / currentImpressions) * 100 : 0;
+      const currentNetGrowth = timeSeries.reduce(
+        (sum, s) => sum + Number(s.netFollowers || 0),
+        0,
+      );
+      const currentImpressions = timeSeries.reduce(
+        (sum, s) => sum + Number(s.impressions || 0),
+        0,
+      );
+      const currentVideoViews = timeSeries.reduce(
+        (sum, s) => sum + Number(s.videoViews || 0),
+        0,
+      );
+      const currentEngagements = timeSeries.reduce(
+        (sum, s) => sum + Number(s.engagements || 0),
+        0,
+      );
+      const currentPageViews = timeSeries.reduce(
+        (sum, s) => sum + Number(s.pageViews || 0),
+        0,
+      );
+      const currentMessages = timeSeries.reduce(
+        (sum, s) => sum + Number(s.messages || 0),
+        0,
+      );
+      const currentRevenue = timeSeries.reduce(
+        (sum, s) => sum + Number(s.revenue || 0),
+        0,
+      );
 
-      const prevNetGrowth = prevSnapshots.reduce((sum, s) => sum + (Number(s.followersGained) || 0) - (Number(s.unfollows) || 0), 0);
+      const currentEngRate =
+        currentImpressions > 0
+          ? (currentEngagements / currentImpressions) * 100
+          : 0;
+
+      const prevNetGrowth = prevSnapshots.reduce(
+        (sum, s) =>
+          sum + (Number(s.followersGained) || 0) - (Number(s.unfollows) || 0),
+        0,
+      );
       const prevAudience = currentAudience - currentNetGrowth;
-      
-      let prevEngagements = prevSnapshots.reduce((sum, s) => sum + (Number(s.totalEngagement) || 0), 0);
-      let prevImpressions = prevSnapshots.reduce((sum, s) => sum + (Number(s.totalImpressions) || Number(s.totalReach) || 0) + (s.platform === 'facebook' ? Number(s.videoViews) || 0 : 0), 0);
-      let prevVideoViews = prevSnapshots.filter(s => s.platform === 'facebook').reduce((sum, s) => sum + (Number(s.videoViews) || 0), 0);
-      
-      prevPosts.forEach(p => {
-        prevEngagements += Number(p.likes || 0) + Number(p.comments || 0) + Number(p.shares || 0) + Number(p.clicks || 0);
+
+      let prevEngagements = prevSnapshots.reduce(
+        (sum, s) => sum + (Number(s.totalEngagement) || 0),
+        0,
+      );
+      let prevImpressions = prevSnapshots.reduce(
+        (sum, s) =>
+          sum +
+          (Number(s.totalImpressions) || Number(s.totalReach) || 0) +
+          (s.platform === 'facebook' ? Number(s.videoViews) || 0 : 0),
+        0,
+      );
+      let prevVideoViews = prevSnapshots
+        .filter((s) => s.platform === 'facebook')
+        .reduce((sum, s) => sum + (Number(s.videoViews) || 0), 0);
+
+      prevPosts.forEach((p) => {
+        prevEngagements +=
+          Number(p.likes || 0) +
+          Number(p.comments || 0) +
+          Number(p.shares || 0) +
+          Number(p.clicks || 0);
         if (p.platform === 'instagram') {
-            prevVideoViews += Number(p.views || 0);
-            prevImpressions += Number(p.views || 0) + Number(p.reach || 0);
+          prevVideoViews += Number(p.views || 0);
+          prevImpressions += Number(p.views || 0) + Number(p.reach || 0);
         } else if (p.platform === 'facebook') {
-            prevImpressions += Number(p.reach || 0);
+          prevImpressions += Number(p.reach || 0);
         }
       });
-      
-      const prevPageViews = prevSnapshots.reduce((sum, s) => sum + (Number(s.pageViews) || 0), 0);
-      const prevMessages = prevSnapshots.reduce((sum, s) => sum + (Number(s.netMessages) || 0), 0);
-      const prevEngRate = prevImpressions > 0 ? (prevEngagements / prevImpressions) * 100 : 0;
+
+      const prevPageViews = prevSnapshots.reduce(
+        (sum, s) => sum + (Number(s.pageViews) || 0),
+        0,
+      );
+      const prevMessages = prevSnapshots.reduce(
+        (sum, s) => sum + (Number(s.netMessages) || 0),
+        0,
+      );
+      const prevRevenue = prevSnapshots.reduce(
+        (sum, s) => sum + (Number(s.revenue) || 0),
+        0,
+      );
+      const prevEngRate =
+        prevImpressions > 0 ? (prevEngagements / prevImpressions) * 100 : 0;
 
       const calcChange = (current: number, previous: number) => {
         if (previous === 0) return current > 0 ? 100 : current < 0 ? -100 : 0;
@@ -546,17 +565,32 @@ export class AnalyticsController {
           netGrowth: currentNetGrowth,
           growthChange: calcChange(currentNetGrowth, prevNetGrowth).toFixed(1),
           impressions: currentImpressions,
-          impressionsChange: calcChange(currentImpressions, prevImpressions).toFixed(1),
+          impressionsChange: calcChange(
+            currentImpressions,
+            prevImpressions,
+          ).toFixed(1),
           engagements: currentEngagements,
-          engagementsChange: calcChange(currentEngagements, prevEngagements).toFixed(1),
+          engagementsChange: calcChange(
+            currentEngagements,
+            prevEngagements,
+          ).toFixed(1),
           engagementRate: currentEngRate.toFixed(1),
-          engagementRateChange: calcChange(currentEngRate, prevEngRate).toFixed(1),
+          engagementRateChange: calcChange(currentEngRate, prevEngRate).toFixed(
+            1,
+          ),
           pageViews: currentPageViews,
-          pageViewsChange: calcChange(currentPageViews, prevPageViews).toFixed(1),
+          pageViewsChange: calcChange(currentPageViews, prevPageViews).toFixed(
+            1,
+          ),
           videoViews: currentVideoViews,
-          videoViewsChange: calcChange(currentVideoViews, prevVideoViews).toFixed(1),
+          videoViewsChange: calcChange(
+            currentVideoViews,
+            prevVideoViews,
+          ).toFixed(1),
           messages: currentMessages,
           messagesChange: calcChange(currentMessages, prevMessages).toFixed(1),
+          revenue: currentRevenue,
+          revenueChange: calcChange(currentRevenue, prevRevenue).toFixed(1),
         },
       });
     } catch (error: any) {
@@ -617,7 +651,7 @@ export class AnalyticsController {
       if (!profile) return res.status(404).json({ error: 'Profile not found' });
 
       let daysToFetch = body.days;
-      
+
       if (!daysToFetch) {
         const latestSnapshot = await this.snapshotRepo.findOne({
           where: { profileId },
@@ -629,10 +663,10 @@ export class AnalyticsController {
           const today = new Date();
           const diffTime = Math.abs(today.getTime() - lastDate.getTime());
           const diffDays = Math.ceil(diffTime / (1000 * 60 * 60 * 24));
-          
-          daysToFetch = diffDays > 0 ? diffDays + 2 : 2; 
+
+          daysToFetch = diffDays > 0 ? diffDays + 2 : 2;
         } else {
-          daysToFetch = 90; 
+          daysToFetch = 90;
         }
       }
 
@@ -642,15 +676,16 @@ export class AnalyticsController {
         { profileId },
         { syncState: 'SYNCING', lastSyncError: '' },
       );
-      
+
       await this.syncQueue.add('initial-historical-sync', {
         profileId,
         daysToFetch,
       });
 
-      return res
-        .status(200)
-        .json({ success: true, message: `Manual sync queued for ${daysToFetch} days` });
+      return res.status(200).json({
+        success: true,
+        message: `Manual sync queued for ${daysToFetch} days`,
+      });
     } catch (error: any) {
       return res.status(500).json({ error: error.message });
     }

@@ -1,6 +1,7 @@
 import { Entity, Column, PrimaryGeneratedColumn, Index } from 'typeorm';
 
 @Entity('daily_analytics')
+@Index(['date', 'utmSource', 'utmMedium']) // Composite index for aggregated queries
 export class DailyAnalytics {
   @PrimaryGeneratedColumn()
   id: number;

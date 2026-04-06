@@ -37,6 +37,7 @@ export class AuthController {
     return { message, email: userEmail };
   }
 
+  @Public()
   @Post('logout')
   async logout(@Res({ passthrough: true }) res: Response) {
     res.clearCookie('auth_token');

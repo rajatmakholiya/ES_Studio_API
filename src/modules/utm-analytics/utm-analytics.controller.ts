@@ -50,10 +50,78 @@ export class AnalyticsController {
     return await this.analyticsService.getHeadlines(filters);
   }
 
+  @Get('utm/metrics-aggregated')
+  async getAggregatedMetrics(
+    @Query('startDate') startDate: string,
+    @Query('endDate') endDate: string,
+    @Query('utmSource') utmSource?: string | string[],
+    @Query('utmMedium') utmMedium?: string | string[],
+    @Query('utmCampaign') utmCampaign?: string | string[],
+  ) {
+    if (!startDate || !endDate) {
+      throw new HttpException(
+        'Missing startDate or endDate',
+        HttpStatus.BAD_REQUEST,
+      );
+    }
+
+    const filters = {
+      utmSource: this.normalizeArray(utmSource),
+      utmMedium: this.normalizeArray(utmMedium),
+      utmCampaign: this.normalizeArray(utmCampaign),
+    };
+
+    return await this.analyticsService.getAggregatedMetrics(
+      startDate,
+      endDate,
+      filters,
+    );
+  }
+
+  @Get('campaigns')
+  async getCampaigns(
+    @Query('startDate') startDate: string,
+    @Query('endDate') endDate: string,
+    @Query('utmSource') utmSource?: string | string[],
+  ) {
+    if (!startDate || !endDate) {
+      throw new HttpException(
+        'Missing startDate or endDate',
+        HttpStatus.BAD_REQUEST,
+      );
+    }
+    const filters = { utmSource: this.normalizeArray(utmSource) };
+    return await this.analyticsService.getAvailableCampaigns(
+      startDate,
+      endDate,
+      filters,
+    );
+  }
+
+  @Get('country-stats')
+  async getCountryStats(
+    @Query('startDate') startDate: string,
+    @Query('endDate') endDate: string,
+    @Query('utmSource') utmSource?: string | string[],
+  ) {
+    if (!startDate || !endDate) {
+      throw new HttpException(
+        'Missing startDate or endDate',
+        HttpStatus.BAD_REQUEST,
+      );
+    }
+    const filters = { utmSource: this.normalizeArray(utmSource) };
+    return await this.analyticsService.getCountryStats(
+      startDate,
+      endDate,
+      filters,
+    );
+  }
+
   @Post('sync/manual')
   async triggerManualSync() {
-    await this.analyticsService.syncYesterdayData();
-    return { status: 'success', message: 'Sync started' };
+    await this.analyticsService.syncBigQueryData();
+    return { status: 'success', message: 'Sync completed' };
   }
 
   @Post('import/legacy')

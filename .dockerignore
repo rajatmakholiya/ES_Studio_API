@@ -1,0 +1,12 @@
+node_modules
+dist
+.env
+.env.*
+keys.json
+gcp-key.json
+*.md
+.git
+.gitignore
+.vscode
+.idea
+docker-compose.yml

@@ -4,15 +4,15 @@ services:
     container_name: social_postgres
     restart: unless-stopped
     environment:
-      POSTGRES_USER: ${DB_USERNAME}
-      POSTGRES_PASSWORD: ${DB_PASSWORD}
-      POSTGRES_DB: ${DB_NAME}
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: password
+      POSTGRES_DB: social_studio
     ports:
       - '5432:5432'
     volumes:
       - postgres_data:/var/lib/postgresql/data
     healthcheck:
-      test: ['CMD-SHELL', 'pg_isready -U ${DB_USERNAME}']
+      test: ['CMD-SHELL', 'pg_isready -U postgres']
       interval: 10s
       timeout: 5s
       retries: 5
@@ -29,7 +29,7 @@ services:
   backend:
     build:
       context: .
-      dockerfile: Dockerfile
+      dockerfile: DockerFile
     container_name: social_backend
     restart: unless-stopped
     ports:
@@ -37,23 +37,26 @@ services:
     volumes:
       - ./gcp-key.json:/app/gcp-key.json:ro
     environment:
-      - PORT=${PORT}
-      - NODE_ENV=${NODE_ENV}
-      - FRONTEND_URL=${FRONTEND_URL}
+      - PORT=5000
+      - NODE_ENV=development
+      - FRONTEND_URL=http://localhost:3000
       - DB_HOST=postgres-db
-      - DB_PORT=${DB_PORT}
-      - DB_USERNAME=${DB_USERNAME}
-      - DB_PASSWORD=${DB_PASSWORD}
-      - DB_NAME=${DB_NAME}
+      - DB_PORT=5432
+      - DB_USERNAME=postgres
+      - DB_PASSWORD=password
+      - DB_NAME=social_studio
       - REDIS_HOST=redis-cache
       - BIGQUERY_PROJECT_ID=${BIGQUERY_PROJECT_ID}
       - GOOGLE_APPLICATION_CREDENTIALS=/app/gcp-key.json
       - SETUP_SECRET=${SETUP_SECRET}
-  depends_on:
-    postgres-db:
-      condition: service_healthy
-    redis-cache:
-      condition: service_started
+      - META_APP_ID=${META_APP_ID}
+      - META_APP_SECRET=${META_APP_SECRET}
+    depends_on:
+      postgres-db:
+        condition: service_healthy
+      redis-cache:
+        condition: service_started
+
 volumes:
   postgres_data:
   redis_data:

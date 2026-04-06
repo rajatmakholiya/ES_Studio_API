@@ -102,7 +102,7 @@ export const fetchDailySnapshot = async (
       const msgRes = await axios.get(msgUrl);
       if (msgRes.data?.data)
         aggregatedData = [...aggregatedData, ...msgRes.data.data];
-    } catch (msgError: any) {}
+    } catch (msgError: any) { }
   } else if (platform === 'instagram') {
     const totalValueMetrics = [
       'views',
@@ -255,3 +255,498 @@ export const fetchPostDeepInsights = async (
     return [];
   }
 };
+
+/**
+ * Fetch lifetime demographic data for a profile.
+ * Returns gender/age breakdown, top cities, and top countries.
+ * Requires 100+ followers to return data.
+ */
+export const fetchDemographics = async (
+  profileId: string,
+  accessToken: string,
+  platform: 'facebook' | 'instagram',
+): Promise<{
+  genderAge: Record<string, number>;
+  topCities: Record<string, number>;
+  topCountries: Record<string, number>;
+}> => {
+  const result = {
+    genderAge: {} as Record<string, number>,
+    topCities: {} as Record<string, number>,
+    topCountries: {} as Record<string, number>,
+  };
+
+  try {
+    if (platform === 'facebook') {
+      // NOTE: Meta has completely deprecated all Page-level demographic metrics
+      // (page_fans_*, page_follows_*, etc.) from the Graph API as of 2024.
+      // There is no longer any direct API replacement for Page demographics.
+      // We gracefully return empty data to prevent (#100) Invalid Metric errors.
+      console.log(
+        `[Meta API Info] Demographics access is deprecated by Facebook for Pages. Skipping fetch for ${profileId}.`,
+      );
+    } else if (platform === 'instagram') {
+      const metrics = 'audience_gender_age,audience_city,audience_country';
+      const url = `${BASE_URL}/${profileId}/insights?metric=${metrics}&period=lifetime&access_token=${accessToken}`;
+      const response = await axios.get(url);
+
+      if (response.data?.data) {
+        for (const metric of response.data.data) {
+          const value = metric.total_value?.value || metric.values?.[0]?.value;
+          if (!value || typeof value !== 'object') continue;
+
+          if (metric.name === 'audience_gender_age') {
+            result.genderAge = value;
+          } else if (metric.name === 'audience_city') {
+            result.topCities = value;
+          } else if (metric.name === 'audience_country') {
+            result.topCountries = value;
+          }
+        }
+      }
+    }
+  } catch (error: any) {
+    console.warn(
+      `[Meta API Warning] Demographics fetch failed for ${profileId}:`,
+      error.response?.data?.error?.message || error.message,
+    );
+  }
+
+  return result;
+};
+
+/**
+ * Convert a Meta monetary value to dollars.
+ *
+ * Meta's content_monetization_earnings returns:
+ *   { currency: "USD", microAmount: 304898436 }
+ *
+ * Despite the name "micro", empirical testing shows the divisor is 10^8
+ * (i.e. values are in hundredths-of-micro-dollars / nano-cents):
+ *   304898436 / 100,000,000 = $3.05  (matches actual dashboard value)
+ *
+ * Plain numbers (from monetization_approximate_earnings) are already in dollars.
+ */
+function toDollars(raw: any): number {
+  if (raw && typeof raw === 'object' && 'microAmount' in raw) {
+    return (Number(raw.microAmount) || 0) / 100_000_000;
+  }
+  return Number(raw) || 0;
+}
+
+/**
+ * Fetch daily revenue for a Facebook page (Content Monetization Program).
+ * Returns an array of { date, revenue } where revenue is in dollars.
+ * Non-CMP pages will return empty/zero gracefully.
+ */
+export const fetchDailyRevenue = async (
+  profileId: string,
+  accessToken: string,
+  sinceUnix: number,
+  untilUnix: number,
+): Promise<Array<{ date: string; revenue: number }>> => {
+  const results: Array<{ date: string; revenue: number }> = [];
+
+  try {
+    const url = `${BASE_URL}/${profileId}/insights?metric=monetization_approximate_earnings&period=day&since=${sinceUnix}&until=${untilUnix}&access_token=${accessToken}`;
+    const response = await axios.get(url);
+
+    if (response.data?.data?.[0]?.values) {
+      for (const val of response.data.data[0].values) {
+        const actualDate = new Date(val.end_time);
+        actualDate.setDate(actualDate.getDate() - 1);
+        const dateStr = actualDate.toISOString().split('T')[0];
+        // Handle both plain numbers and { currency, microAmount } objects
+        const revenueInDollars = toDollars(val.value);
+        results.push({ date: dateStr, revenue: revenueInDollars });
+      }
+    }
+  } catch (error: any) {
+    // Non-CMP pages will throw — this is expected and not an error
+    console.warn(
+      `[Meta API Info] Revenue data unavailable for ${profileId} (likely not in CMP):`,
+      error.response?.data?.error?.message || error.message,
+    );
+  }
+
+  return results;
+};
+
+export interface SegregatedRevenueDay {
+  date: string;
+  bonus: number;
+  photo: number;
+  reel: number;
+  story: number;
+  text: number;
+  total: number;
+}
+
+/**
+ * Normalise the keys Meta returns for content-type earnings into our
+ * five canonical buckets: bonus, photo, reel, story, text.
+ *
+ * Skips non-earning keys like `currency`.
+ * Handles microAmount objects automatically.
+ */
+function normaliseCMPValue(raw: Record<string, any>): {
+  bonus: number; photo: number; reel: number; story: number; text: number;
+} {
+  let bonus = 0, photo = 0, reel = 0, story = 0, text = 0;
+
+  for (const [rawKey, rawVal] of Object.entries(raw)) {
+    const k = rawKey.toLowerCase();
+
+    // Skip non-earning metadata keys
+    if (k === 'currency' || k === 'end_time') continue;
+
+    const v = toDollars(rawVal);
+    if (v === 0) continue;
+
+    if (k.includes('bonus') || k.includes('extra'))                   bonus += v;
+    else if (k.includes('reel'))                                      reel  += v;
+    else if (k.includes('video') || k.includes('in_stream') || k.includes('in-stream'))
+                                                                      reel  += v;
+    else if (k.includes('story') || k.includes('stories') || k.includes('interstitial'))
+                                                                      story += v;
+    else if (k.includes('photo') || k.includes('image'))              photo += v;
+    else if (k.includes('text') || k.includes('short_form'))          text  += v;
+    else if (k === 'microamount') {
+      // Single total from content_monetization_earnings (no breakdown) —
+      // the whole object is { currency, microAmount } representing a total.
+      // Put under bonus as fallback; this path is only hit when breakdown
+      // is not available and we can't split further.
+      bonus += v;
+    }
+    else {
+      console.warn(`[Meta API] Unknown CMP earning type "${rawKey}" = ${v}`);
+      bonus += v;
+    }
+  }
+
+  return { bonus, photo, reel, story, text };
+}
+
+/**
+ * Parse a Meta insights response (array of day values) into SegregatedRevenueDay[].
+ * Handles both object values (breakdown) and scalar / microAmount values (total).
+ */
+function parseSegregatedValues(values: any[]): SegregatedRevenueDay[] {
+  const out: SegregatedRevenueDay[] = [];
+  for (const val of values) {
+    const actualDate = new Date(val.end_time);
+    actualDate.setDate(actualDate.getDate() - 1);
+    const dateStr = actualDate.toISOString().split('T')[0];
+
+    const v = val.value;
+
+    // { currency: "USD", microAmount: N } — single total, not a breakdown
+    if (v && typeof v === 'object' && 'microAmount' in v) {
+      const n = toDollars(v);
+      out.push({ date: dateStr, bonus: n, photo: 0, reel: 0, story: 0, text: 0, total: n });
+    }
+    // Object with content-type keys (actual breakdown)
+    else if (v && typeof v === 'object' && !Array.isArray(v)) {
+      const parsed = normaliseCMPValue(v);
+      const total = parsed.bonus + parsed.photo + parsed.reel + parsed.story + parsed.text;
+      out.push({ date: dateStr, ...parsed, total });
+    }
+    // Plain number → already in dollars
+    else if (typeof v === 'number' || typeof v === 'string') {
+      const n = Number(v) || 0;
+      out.push({ date: dateStr, bonus: n, photo: 0, reel: 0, story: 0, text: 0, total: n });
+    }
+  }
+  return out;
+}
+
+/**
+ * Fetch segregated daily revenue breakdown by content type from the
+ * Content Monetization Program.
+ *
+ * Uses the documented approach:
+ *   GET /{page-id}/insights?metric=content_monetization_earnings
+ *       &breakdown=content_type&period=day
+ *
+ * Fallback: `monetization_approximate_earnings` (total only, under bonus).
+ *
+ * Chunks into ≤ 30-day windows so Meta doesn't silently truncate days.
+ */
+export const fetchSegregatedRevenue = async (
+  profileId: string,
+  accessToken: string,
+  sinceUnix: number,
+  untilUnix: number,
+): Promise<SegregatedRevenueDay[]> => {
+  // --- Build 30-day chunks ---
+  const CHUNK_SECS = 30 * 24 * 60 * 60;
+  const chunks: Array<{ since: number; until: number }> = [];
+  let cur = sinceUnix;
+  while (cur < untilUnix) {
+    const end = Math.min(cur + CHUNK_SECS, untilUnix);
+    chunks.push({ since: cur, until: end });
+    cur = end;
+  }
+
+  const allResults: SegregatedRevenueDay[] = [];
+
+  for (const chunk of chunks) {
+    const chunkResults = await fetchSegregatedRevenueChunk(
+      profileId, accessToken, chunk.since, chunk.until,
+    );
+    allResults.push(...chunkResults);
+  }
+
+  // Deduplicate by date (overlapping chunk boundaries)
+  const byDate = new Map<string, SegregatedRevenueDay>();
+  for (const row of allResults) {
+    byDate.set(row.date, row);
+  }
+
+  const deduped = Array.from(byDate.values());
+  if (deduped.length > 0) {
+    console.log(
+      `[Meta API] Segregated revenue for ${profileId}: ${deduped.length} days across ${chunks.length} chunk(s)`,
+    );
+  }
+  return deduped;
+};
+
+/**
+ * Fetch a single ≤ 30-day chunk of segregated revenue.
+ *
+ * Per official Meta docs:
+ *   - content_monetization_earnings → valid breakdown: "earning_source"
+ *   - monetization_approximate_earnings → valid breakdown: "monetization_tool"
+ *
+ * Meta may return the breakdown in two shapes:
+ *   A) Multiple top-level data entries (one per earning source), each with
+ *      per-day values as { currency, microAmount } or numbers.
+ *   B) A single data entry whose per-day values are objects with content-type
+ *      keys (e.g. { "reels": {currency, microAmount}, "photos_text_stories": ... }).
+ *
+ * Priority:
+ *   1. content_monetization_earnings + breakdown=earning_source  (shape A or B)
+ *   2. monetization_approximate_earnings + breakdown=monetization_tool (shape A or B)
+ *   3. content_monetization_earnings (no breakdown → total only)
+ *   4. monetization_approximate_earnings (legacy total)
+ */
+async function fetchSegregatedRevenueChunk(
+  profileId: string,
+  accessToken: string,
+  sinceUnix: number,
+  untilUnix: number,
+): Promise<SegregatedRevenueDay[]> {
+
+  // --- Attempt 1: content_monetization_earnings + breakdown=earning_source ---
+  // This is the primary source. Meta returns each value with an `earning_source`
+  // sibling field (Shape C): { value: 20.23, earning_source: "image", end_time: "..." }
+  // OR multiple data entries (Shape A), one per earning source.
+  try {
+    const url =
+      `${BASE_URL}/${profileId}/insights` +
+      `?metric=content_monetization_earnings` +
+      `&period=day&since=${sinceUnix}&until=${untilUnix}` +
+      `&breakdown=earning_source` +
+      `&access_token=${accessToken}`;
+
+    const response = await axios.get(url);
+    const dataEntries = response.data?.data || [];
+
+    if (dataEntries.length > 0) {
+      // Log for diagnostics
+      if (dataEntries[0]?.values?.length > 0) {
+        console.log(
+          `[Meta API] content_monetization_earnings+earning_source: ${dataEntries.length} entries, sample value: ${JSON.stringify(dataEntries[0].values[0]).slice(0, 500)}`,
+        );
+      }
+
+      // Try parsing — handles Shape A (multiple entries) and Shape C (earning_source field)
+      const result = parseEarningSourceResponse(dataEntries);
+      if (result.length > 0) {
+        console.log(
+          `[Meta API] Segregated breakdown parsed for ${profileId}: ${result.length} days (Attempt 1)`,
+        );
+        return result;
+      }
+    }
+  } catch (err: any) {
+    console.warn(
+      `[Meta API] Attempt 1 (content_monetization_earnings+earning_source) failed for ${profileId}:`,
+      err.response?.data?.error?.message || err.message,
+    );
+  }
+
+  // --- Attempt 2: monetization_approximate_earnings + breakdown=monetization_tool ---
+  // This tends to return "content_monetization" as the tool (not content-type breakdown).
+  // Less useful for segregation, but try it as fallback.
+  try {
+    const url =
+      `${BASE_URL}/${profileId}/insights` +
+      `?metric=monetization_approximate_earnings` +
+      `&period=day&since=${sinceUnix}&until=${untilUnix}` +
+      `&breakdown=monetization_tool` +
+      `&access_token=${accessToken}`;
+
+    const response = await axios.get(url);
+    const dataEntries = response.data?.data || [];
+
+    if (dataEntries.length > 0) {
+      if (dataEntries[0]?.values?.length > 0) {
+        console.log(
+          `[Meta API] monetization_approximate_earnings+monetization_tool: ${dataEntries.length} entries, sample: ${JSON.stringify(dataEntries[0].values[0]).slice(0, 300)}`,
+        );
+      }
+
+      // This metric returns monetization_tool (e.g. "content_monetization") not content type.
+      // Still parse it — if there are multiple tools we can get SOME segregation.
+      const result = parseEarningSourceResponse(dataEntries);
+      if (result.length > 0) return result;
+    }
+  } catch (err: any) {
+    console.warn(
+      `[Meta API] Attempt 2 (monetization_approximate_earnings+monetization_tool) failed for ${profileId}:`,
+      err.response?.data?.error?.message || err.message,
+    );
+  }
+
+  // --- Attempt 3: content_monetization_earnings (no breakdown) → total only ---
+  try {
+    const url =
+      `${BASE_URL}/${profileId}/insights` +
+      `?metric=content_monetization_earnings` +
+      `&period=day&since=${sinceUnix}&until=${untilUnix}` +
+      `&access_token=${accessToken}`;
+
+    const response = await axios.get(url);
+    const values = response.data?.data?.[0]?.values;
+
+    if (values?.length) {
+      console.log(
+        `[Meta API] content_monetization_earnings (no breakdown) for ${profileId}: ${values.length} days, sample:`,
+        JSON.stringify(values[0]?.value).slice(0, 200),
+      );
+      const parsed = parseSegregatedValues(values);
+      if (parsed.length > 0) return parsed;
+    }
+  } catch (err: any) {
+    console.warn(
+      `[Meta API] Attempt 3 (content_monetization_earnings no breakdown) failed for ${profileId}:`,
+      err.response?.data?.error?.message || err.message,
+    );
+  }
+
+  // --- Fallback: monetization_approximate_earnings (legacy total) ---
+  console.warn(
+    `[Meta API] All segregated attempts failed for ${profileId}, using legacy total`,
+  );
+  const totalRevenue = await fetchDailyRevenue(profileId, accessToken, sinceUnix, untilUnix);
+  return totalRevenue.map((rv) => ({
+    date: rv.date,
+    bonus: rv.revenue,
+    photo: 0,
+    reel: 0,
+    story: 0,
+    text: 0,
+    total: rv.revenue,
+  }));
+}
+
+/**
+ * Parse Meta's earning_source / monetization_tool breakdown response.
+ *
+ * Handles all observed response shapes:
+ *
+ * Shape A — Multiple top-level data entries (one per earning source):
+ *   data: [
+ *     { title: "Reels", values: [{ value: 12.34, end_time }] },
+ *     { title: "Bonus", values: [{ value: 5.67, end_time }] },
+ *   ]
+ *
+ * Shape C — Single data entry where each value has an `earning_source`
+ *   or `monetization_tool` sibling field:
+ *   data: [{ values: [
+ *     { value: 20.23, earning_source: "image", end_time: "..." },
+ *     { value: 5.00,  earning_source: "reel",  end_time: "..." },
+ *   ]}]
+ *
+ * In both shapes, we merge per-date into SegregatedRevenueDay records.
+ */
+function parseEarningSourceResponse(dataEntries: any[]): SegregatedRevenueDay[] {
+  const dayMap = new Map<string, SegregatedRevenueDay>();
+
+  for (const entry of dataEntries) {
+    // Shape A: entry-level label (used when there are multiple entries)
+    const entryLabel = (
+      entry.title || entry.name || entry.description || entry.id || ''
+    ).toLowerCase();
+
+    for (const val of entry.values || []) {
+      const actualDate = new Date(val.end_time);
+      actualDate.setDate(actualDate.getDate() - 1);
+      const dateStr = actualDate.toISOString().split('T')[0];
+      const amount = toDollars(val.value);
+
+      if (!dayMap.has(dateStr)) {
+        dayMap.set(dateStr, {
+          date: dateStr, bonus: 0, photo: 0, reel: 0, story: 0, text: 0, total: 0,
+        });
+      }
+      const day = dayMap.get(dateStr)!;
+
+      // Determine the content-type label.
+      // Shape C: use the `earning_source` or `monetization_tool` sibling field.
+      // Shape A: use the entry-level title/name.
+      const sourceLabel = (
+        val.earning_source || val.monetization_tool || entryLabel || ''
+      ).toLowerCase();
+
+      // Map the label to our 5 canonical buckets
+      addAmountToBucket(day, sourceLabel, amount);
+
+      day.total = day.bonus + day.photo + day.reel + day.story + day.text;
+    }
+  }
+
+  return Array.from(dayMap.values());
+}
+
+/**
+ * Map a Meta earning_source / monetization_tool label to one of our
+ * 5 revenue buckets: bonus, photo, reel, story, text.
+ *
+ * Known `earning_source` values from Meta API:
+ *   "image", "reel", "video", "text", "bonus", "story",
+ *   "in_stream", "in-stream", "extra", "performance_bonus",
+ *   "photos, text & stories", "content_monetization"
+ */
+function addAmountToBucket(day: SegregatedRevenueDay, label: string, amount: number) {
+  if (amount === 0) return;
+
+  if (label.includes('bonus') || label.includes('extra') || label.includes('performance'))
+                                                          day.bonus += amount;
+  else if (label === 'reel' || label.includes('reel'))    day.reel  += amount;
+  else if (label.includes('video') || label.includes('in_stream') || label.includes('in-stream'))
+                                                          day.reel  += amount;
+  else if (label === 'image' || label.includes('photo') || label.includes('image'))
+                                                          day.photo += amount;
+  else if (label.includes('photos, text') || label.includes('photo, text')) {
+    // Meta sometimes groups "Photos, text & stories" as one label.
+    // Assign to photo as primary bucket.
+    day.photo += amount;
+  }
+  else if (label.includes('story') || label.includes('stories'))
+                                                          day.story += amount;
+  else if (label === 'text' || label.includes('text') || label.includes('short_form'))
+                                                          day.text  += amount;
+  else if (label.includes('content_monetization')) {
+    // monetization_tool="content_monetization" — this is the umbrella tool, not a content type.
+    // Treat as bonus (total CMP earnings without content-type split).
+    day.bonus += amount;
+  }
+  else {
+    console.warn(`[Meta API] Unknown earning source "${label}" = $${amount.toFixed(4)}, adding to bonus`);
+    day.bonus += amount;
+  }
+}
+

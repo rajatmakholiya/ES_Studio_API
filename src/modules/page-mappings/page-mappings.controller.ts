@@ -2,6 +2,7 @@ import {
   Controller,
   Get,
   Post,
+  Patch,
   Delete,
   Body,
   Param,
@@ -31,6 +32,11 @@ export class PageMappingsController {
   @Delete(':id')
   remove(@Param('id') id: string) {
     return this.service.remove(+id);
+  }
+
+  @Patch(':id')
+  update(@Param('id') id: string, @Body() mapping: Partial<PageMapping>) {
+    return this.service.update(+id, mapping);
   }
 
   @Post('import')

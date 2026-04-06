@@ -8,6 +8,9 @@ export class PageMapping {
   @Column()
   category: string;
 
+  @Column({ type: 'varchar', nullable: true, default: null })
+  team: string | null;
+
   @Column()
   platform: string;
 
@@ -17,6 +20,6 @@ export class PageMapping {
   @Column()
   utmSource: string;
 
-  @Column("text", { array: true })
+  @Column('text', { array: true })
   utmMediums: string[];
 }

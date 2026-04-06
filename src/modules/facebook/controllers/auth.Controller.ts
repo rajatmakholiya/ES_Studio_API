@@ -7,6 +7,9 @@ import type { Queue } from 'bull';
 import { SocialProfile } from '../entities/SocialProfile.entity';
 import { AnalyticsSnapshot } from '../entities/AnalyticsSnapshot.entity';
 import { SocialPost } from '../entities/SocialPost.entity';
+import { DemographicSnapshot } from '../entities/DemographicSnapshot.entity';
+import { DailyRevenue } from '../../revenue/entities/daily-revenue.entity';
+import { RevenueMapping } from '../../revenue/entities/revenue-mapping.entity';
 import {
   exchangeForLongLivedToken,
   fetchLinkedInstagramAccounts,
@@ -22,6 +25,12 @@ export class AuthController {
     private snapshotRepo: Repository<AnalyticsSnapshot>,
     @InjectRepository(SocialPost)
     private postRepo: Repository<SocialPost>,
+    @InjectRepository(DemographicSnapshot)
+    private demographicRepo: Repository<DemographicSnapshot>,
+    @InjectRepository(DailyRevenue)
+    private dailyRevenueRepo: Repository<DailyRevenue>,
+    @InjectRepository(RevenueMapping)
+    private revenueMappingRepo: Repository<RevenueMapping>,
     @InjectQueue('social-sync-queue') private syncQueue: Queue,
   ) {}
 
@@ -162,6 +171,17 @@ export class AuthController {
       }
 
       if (deleteData) {
+        // Delete revenue data for the affected Facebook pages
+        if (platform === 'all' || platform === 'facebook') {
+          const fbProfiles = profiles.filter((p) => p.platform === 'facebook');
+          const fbPageIds = fbProfiles.map((p) => p.profileId);
+          if (fbPageIds.length > 0) {
+            await this.dailyRevenueRepo.delete({ pageId: In(fbPageIds) });
+            await this.revenueMappingRepo.delete({ pageId: In(fbPageIds) });
+          }
+        }
+
+        await this.demographicRepo.delete({ platform: platformQuery as any });
         await this.snapshotRepo.delete({ platform: platformQuery as any });
         await this.postRepo.delete({ platform: platformQuery as any });
         await this.profileRepo.delete({ platform: platformQuery as any });

@@ -23,6 +23,11 @@ export class PageMappingsService {
     return this.mappingRepository.save(newMapping);
   }
 
+  async update(id: number, partial: Partial<PageMapping>) {
+    await this.mappingRepository.update(id, partial);
+    return this.mappingRepository.findOneBy({ id });
+  }
+
   async remove(id: number) {
     await this.mappingRepository.delete(id);
     return { deleted: true };
@@ -49,8 +54,19 @@ export class PageMappingsService {
       const values = this.parseCSVLine(line);
 
       if (values.length >= 6) {
-        const [id, category, platform, pageName, utmSource, utmMediumsStr] =
-          values;
+        // Support both old format (no team) and new format (with team as 3rd col)
+        // Old: id, category, platform, pageName, utmSource, utmMediums
+        // New: id, category, team, platform, pageName, utmSource, utmMediums
+        let category: string, team: string | null, platform: string, pageName: string, utmSource: string, utmMediumsStr: string;
+
+        if (values.length >= 7) {
+          // New format: team is 3rd column
+          [, category, team, platform, pageName, utmSource, utmMediumsStr] = values;
+        } else {
+          // Old format: no team column
+          [, category, platform, pageName, utmSource, utmMediumsStr] = values;
+          team = null;
+        }
 
         let cleanedMediumsStr = utmMediumsStr || '';
         cleanedMediumsStr = cleanedMediumsStr.replace(/^\{|\}$/g, '');
@@ -73,6 +89,7 @@ export class PageMappingsService {
 
         mappings.push({
           category: category?.trim(),
+          team: team?.trim() || null,
           platform: platform?.trim(),
           pageName: pageName?.trim(),
           utmSource: utmSource?.trim(),

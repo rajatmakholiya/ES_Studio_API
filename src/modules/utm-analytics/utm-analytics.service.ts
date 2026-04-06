@@ -45,11 +45,6 @@ export class AnalyticsService {
         'a.utmSource as utm_source',
         'a.utmMedium as utm_medium',
         'a.utmCampaign as utm_campaign',
-        'a.country as country',
-        'a.city as city',
-        'a.deviceCategory as device_category',
-        'a.userGender as user_gender',
-        'a.userAge as user_age',
         'SUM(a.sessions) as sessions',
         'SUM(a.pageviews) as pageviews',
         'SUM(a.users) as users',
@@ -64,11 +59,6 @@ export class AnalyticsService {
       qb.addGroupBy('a.utmSource');
       qb.addGroupBy('a.utmMedium');
       qb.addGroupBy('a.utmCampaign');
-      qb.addGroupBy('a.country');
-      qb.addGroupBy('a.city');
-      qb.addGroupBy('a.deviceCategory');
-      qb.addGroupBy('a.userGender');
-      qb.addGroupBy('a.userAge');
       qb.orderBy('event_day', 'ASC');
     } else {
       const timeBucket =
@@ -87,6 +77,87 @@ export class AnalyticsService {
       qb.groupBy('period');
       qb.orderBy('period', 'ASC');
     }
+
+    return await qb.getRawMany();
+  }
+
+  /**
+   * Memory-optimized aggregated metrics endpoint.
+   * Groups by (date, utmMedium) only — pushes all aggregation to PostgreSQL
+   * to avoid loading hundreds of thousands of rows into Node.js memory.
+   * Typical result: ~50 mediums × ~90 days = ~4,500 rows vs 100k+ from getMetrics.
+   */
+  async getAggregatedMetrics(startDate: string, endDate: string, filters: any) {
+    const qb = this.analyticsRepo.createQueryBuilder('a');
+    qb.where(
+      'a.date::date >= :startDate::date AND a.date::date <= :endDate::date',
+      { startDate, endDate },
+    );
+
+    this.applyFilter(qb, 'utmSource', filters.utmSource);
+    this.applyFilter(qb, 'utmMedium', filters.utmMedium);
+    this.applyFilter(qb, 'utmCampaign', filters.utmCampaign);
+
+    qb.select([
+      "TO_CHAR(a.date, 'YYYY-MM-DD') as event_day",
+      'a.utmMedium as utm_medium',
+      'SUM(a.sessions) as sessions',
+      'SUM(a.pageviews) as pageviews',
+      'SUM(a.users) as users',
+      'SUM(a.newUsers) as new_users',
+      'SUM(a.recurringUsers) as recurring_users',
+      'SUM(a.identifiedUsers) as identified_users',
+      'SUM(a.eventCount) as event_count',
+      'AVG(a.engagementRate) as engagement_rate',
+    ]);
+
+    qb.groupBy("TO_CHAR(a.date, 'YYYY-MM-DD')");
+    qb.addGroupBy('a.utmMedium');
+    qb.orderBy('event_day', 'ASC');
+
+    // Hard safety limit to prevent OOM
+    qb.limit(50000);
+
+    return await qb.getRawMany();
+  }
+
+  /**
+   * Returns the list of distinct campaigns for a given source + date range.
+   * Lightweight query — only returns campaign names, no metrics.
+   */
+  async getAvailableCampaigns(
+    startDate: string,
+    endDate: string,
+    filters: any,
+  ) {
+    const qb = this.analyticsRepo.createQueryBuilder('a');
+    qb.where(
+      'a.date::date >= :startDate::date AND a.date::date <= :endDate::date',
+      { startDate, endDate },
+    );
+    this.applyFilter(qb, 'utmSource', filters.utmSource);
+
+    qb.select('DISTINCT a.utmCampaign', 'utm_campaign');
+    qb.orderBy('a.utmCampaign', 'ASC');
+
+    return await qb.getRawMany();
+  }
+
+  async getCountryStats(startDate: string, endDate: string, filters: any) {
+    const qb = this.analyticsRepo.createQueryBuilder('a');
+    qb.where(
+      'a.date::date >= :startDate::date AND a.date::date <= :endDate::date',
+      { startDate, endDate },
+    );
+
+    this.applyFilter(qb, 'utmSource', filters.utmSource);
+    this.applyFilter(qb, 'utmMedium', filters.utmMedium);
+    this.applyFilter(qb, 'utmCampaign', filters.utmCampaign);
+
+    qb.select(['a.country as country', 'SUM(a.sessions) as sessions']);
+    qb.groupBy('a.country');
+    qb.orderBy('sessions', 'DESC');
+    qb.limit(10);
 
     return await qb.getRawMany();
   }
@@ -243,10 +314,26 @@ export class AnalyticsService {
   }
 
   @Cron('30 13 * * *', { timeZone: 'Asia/Kolkata' })
-  async syncYesterdayData() {
-    this.logger.log('Starting Daily Analytics Sync from BigQuery Stream...');
+  async scheduledSync() {
+    await this.syncBigQueryData(false);
+  }
 
-    const query = `
+  async syncBigQueryData(fullSync: boolean = true) {
+    this.logger.log(
+      fullSync
+        ? 'Starting Full BQ Sync (all available data)...'
+        : 'Starting Daily Analytics Sync from BigQuery Stream...',
+    );
+
+    const query = fullSync
+      ? `
+      SELECT
+        date, utm_source, utm_medium, utm_campaign,
+        country, city, device_category, user_gender, user_age,
+        sessions, pageviews, users, new_users, recurring_users, identified_users, event_count, engagement_rate
+      FROM \`bigquerytest-486307.analytics_266571177.utm_daily_metrics\`
+    `
+      : `
       SELECT
         date, utm_source, utm_medium, utm_campaign,
         country, city, device_category, user_gender, user_age,
@@ -390,6 +477,15 @@ export class AnalyticsService {
 
   private applyFilter(qb: any, column: string, value?: string | string[]) {
     if (!value) return;
+
+    // Normalize Facebook/Instagram traffic variations coming from Google Analytics
+    if (column === 'utmSource' && value === 'fb') {
+      qb.andWhere(
+        `(a.${column} ILIKE '%face%' OR a.${column} ILIKE '%ig%' OR a.${column} ILIKE '%insta%' OR a.${column} IN ('fb', 'Fb'))`,
+      );
+      return;
+    }
+
     if (Array.isArray(value)) {
       qb.andWhere(`a.${column} IN (:...${column})`, { [column]: value });
     } else {

@@ -24,7 +24,7 @@ export class CronService {
     this.logger.log(
       'Starting automated daily background sync for active profiles...',
     );
-    
+
     const activeProfiles = await this.profileRepo.find({
       where: { isActive: true },
     });
@@ -62,7 +62,7 @@ export class CronService {
         { profileId: profile.profileId },
         { syncState: 'SYNCING' },
       );
-      
+
       await this.syncQueue.add('initial-historical-sync', {
         profileId: profile.profileId,
         daysToFetch,
