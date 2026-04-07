@@ -30,10 +30,12 @@ export class AnalyticsService {
     filters: any,
   ) {
     const qb = this.analyticsRepo.createQueryBuilder('a');
-    qb.where(
-      'a.date::date >= :startDate::date AND a.date::date <= :endDate::date',
-      { startDate, endDate },
-    );
+    // Use direct date comparison — column is already type date, no cast needed.
+    // Casting with ::date prevents PostgreSQL from using the index on "date".
+    qb.where('a.date >= :startDate AND a.date <= :endDate', {
+      startDate,
+      endDate,
+    });
 
     this.applyFilter(qb, 'utmSource', filters.utmSource);
     this.applyFilter(qb, 'utmMedium', filters.utmMedium);
@@ -63,8 +65,8 @@ export class AnalyticsService {
     } else {
       const timeBucket =
         rollup === 'weekly'
-          ? "DATE_TRUNC('week', a.date::date)"
-          : "DATE_TRUNC('month', a.date::date)";
+          ? "DATE_TRUNC('week', a.date)"
+          : "DATE_TRUNC('month', a.date)";
 
       qb.select([
         `${timeBucket} as period`,
@@ -78,6 +80,10 @@ export class AnalyticsService {
       qb.orderBy('period', 'ASC');
     }
 
+    // Safety limit: daily rollup can produce many rows (days x sources x mediums x campaigns).
+    // Weekly/monthly rollups produce far fewer, but still capped as a safety net.
+    qb.limit(rollup === 'daily' ? 10000 : 5000);
+
     return await qb.getRawMany();
   }
 
@@ -89,10 +95,10 @@ export class AnalyticsService {
    */
   async getAggregatedMetrics(startDate: string, endDate: string, filters: any) {
     const qb = this.analyticsRepo.createQueryBuilder('a');
-    qb.where(
-      'a.date::date >= :startDate::date AND a.date::date <= :endDate::date',
-      { startDate, endDate },
-    );
+    qb.where('a.date >= :startDate AND a.date <= :endDate', {
+      startDate,
+      endDate,
+    });
 
     this.applyFilter(qb, 'utmSource', filters.utmSource);
     this.applyFilter(qb, 'utmMedium', filters.utmMedium);
@@ -131,24 +137,25 @@ export class AnalyticsService {
     filters: any,
   ) {
     const qb = this.analyticsRepo.createQueryBuilder('a');
-    qb.where(
-      'a.date::date >= :startDate::date AND a.date::date <= :endDate::date',
-      { startDate, endDate },
-    );
+    qb.where('a.date >= :startDate AND a.date <= :endDate', {
+      startDate,
+      endDate,
+    });
     this.applyFilter(qb, 'utmSource', filters.utmSource);
 
     qb.select('DISTINCT a.utmCampaign', 'utm_campaign');
     qb.orderBy('a.utmCampaign', 'ASC');
+    qb.limit(500);
 
     return await qb.getRawMany();
   }
 
   async getCountryStats(startDate: string, endDate: string, filters: any) {
     const qb = this.analyticsRepo.createQueryBuilder('a');
-    qb.where(
-      'a.date::date >= :startDate::date AND a.date::date <= :endDate::date',
-      { startDate, endDate },
-    );
+    qb.where('a.date >= :startDate AND a.date <= :endDate', {
+      startDate,
+      endDate,
+    });
 
     this.applyFilter(qb, 'utmSource', filters.utmSource);
     this.applyFilter(qb, 'utmMedium', filters.utmMedium);
@@ -167,49 +174,59 @@ export class AnalyticsService {
     const yesterday = subDays(today, 1);
     const dayBeforeYesterday = subDays(today, 2);
 
+    const yesterdayStr = format(yesterday, 'yyyy-MM-dd');
+    const dayBeforeStr = format(dayBeforeYesterday, 'yyyy-MM-dd');
     const last7Start = format(subDays(today, 7), 'yyyy-MM-dd');
     const last7End = format(yesterday, 'yyyy-MM-dd');
     const prev7Start = format(subDays(today, 14), 'yyyy-MM-dd');
     const prev7End = format(subDays(today, 8), 'yyyy-MM-dd');
 
-    const [todayStats] = await this.getDateRangeStats(
-      format(yesterday, 'yyyy-MM-dd'),
-      format(yesterday, 'yyyy-MM-dd'),
-      filters,
-    );
-    const [yesterdayStats] = await this.getDateRangeStats(
-      format(dayBeforeYesterday, 'yyyy-MM-dd'),
-      format(dayBeforeYesterday, 'yyyy-MM-dd'),
-      filters,
-    );
-    const [thisWeekStats] = await this.getDateRangeStats(
+    // Single query with conditional SUMs — 1 table scan instead of 4
+    const qb = this.analyticsRepo.createQueryBuilder('a');
+    qb.where('a.date >= :earliest AND a.date <= :latest', {
+      earliest: prev7Start,
+      latest: yesterdayStr,
+    });
+    this.applyFilter(qb, 'utmSource', filters.utmSource);
+
+    qb.select([
+      `SUM(CASE WHEN a.date = :yesterdayStr THEN a.sessions ELSE 0 END) as today_sessions`,
+      `SUM(CASE WHEN a.date = :dayBeforeStr THEN a.sessions ELSE 0 END) as yesterday_sessions`,
+      `SUM(CASE WHEN a.date = :yesterdayStr THEN a.users ELSE 0 END) as today_users`,
+      `SUM(CASE WHEN a.date = :dayBeforeStr THEN a.users ELSE 0 END) as yesterday_users`,
+      `SUM(CASE WHEN a.date >= :last7Start AND a.date <= :last7End THEN a.sessions ELSE 0 END) as this_week_sessions`,
+      `SUM(CASE WHEN a.date >= :prev7Start AND a.date <= :prev7End THEN a.sessions ELSE 0 END) as last_week_sessions`,
+      `SUM(CASE WHEN a.date >= :last7Start AND a.date <= :last7End THEN a.users ELSE 0 END) as this_week_users`,
+      `SUM(CASE WHEN a.date >= :prev7Start AND a.date <= :prev7End THEN a.users ELSE 0 END) as last_week_users`,
+    ]);
+    qb.setParameters({
+      yesterdayStr,
+      dayBeforeStr,
       last7Start,
       last7End,
-      filters,
-    );
-    const [lastWeekStats] = await this.getDateRangeStats(
       prev7Start,
       prev7End,
-      filters,
-    );
+    });
+
+    const row = await qb.getRawOne();
 
     return {
       daily: {
-        date: format(yesterday, 'yyyy-MM-dd'),
-        sessions: Number(todayStats?.sessions || 0),
-        prevSessions: Number(yesterdayStats?.sessions || 0),
+        date: yesterdayStr,
+        sessions: Number(row?.today_sessions || 0),
+        prevSessions: Number(row?.yesterday_sessions || 0),
         diff: this.calculatePercentDiff(
-          todayStats?.sessions,
-          yesterdayStats?.sessions,
+          row?.today_sessions,
+          row?.yesterday_sessions,
         ),
       },
       weekly: {
         range: `${last7Start} to ${last7End}`,
-        sessions: Number(thisWeekStats?.sessions || 0),
-        prevSessions: Number(lastWeekStats?.sessions || 0),
+        sessions: Number(row?.this_week_sessions || 0),
+        prevSessions: Number(row?.last_week_sessions || 0),
         diff: this.calculatePercentDiff(
-          thisWeekStats?.sessions,
-          lastWeekStats?.sessions,
+          row?.this_week_sessions,
+          row?.last_week_sessions,
         ),
       },
     };
@@ -454,20 +471,6 @@ export class AnalyticsService {
       lastField = lastField.slice(1, -1);
     result.push(lastField);
     return result;
-  }
-
-  private async getDateRangeStats(
-    startDate: string,
-    endDate: string,
-    filters: { utmSource?: string | string[] },
-  ) {
-    const qb = this.analyticsRepo
-      .createQueryBuilder('a')
-      .select('SUM(a.sessions)', 'sessions')
-      .addSelect('SUM(a.users)', 'users')
-      .where('a.date BETWEEN :startDate AND :endDate', { startDate, endDate });
-    this.applyFilter(qb, 'utmSource', filters.utmSource);
-    return qb.getRawMany();
   }
 
   private calculatePercentDiff(current: number, previous: number) {

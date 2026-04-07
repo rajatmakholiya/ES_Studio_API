@@ -71,30 +71,120 @@ export class CsvGeneratorService {
             }
         }
 
-        const csvRows: string[] = [
-            'Page Name,Category,Team,Sessions,Users,Pageviews,Engagement Rate,Recurring Users,New Users,Event Count',
-        ];
+        // Build enriched rows with team info
+        const enrichedRows: Array<{
+            pageName: string; category: string; team: string;
+            sessions: number; users: number; pageviews: number;
+            engagement_rate: number; recurring_users: number;
+            new_users: number; event_count: number;
+        }> = [];
 
         for (const row of rows) {
             const medium = (row.utm_medium || '').toLowerCase();
             const info = mediumToPage.get(medium);
-            const pageName = info?.pageName || row.utm_medium || 'Unknown';
-            const category = info?.category || 'Uncategorized';
-            const team = info?.team || 'Unassigned';
-
-            csvRows.push([
-                this.escapeCSV(pageName),
-                this.escapeCSV(category),
-                this.escapeCSV(team),
-                Number(row.sessions || 0),
-                Number(row.users || 0),
-                Number(row.pageviews || 0),
-                `${Number(row.engagement_rate || 0).toFixed(2)}%`,
-                Number(row.recurring_users || 0),
-                Number(row.new_users || 0),
-                Number(row.event_count || 0),
-            ].join(','));
+            enrichedRows.push({
+                pageName: info?.pageName || row.utm_medium || 'Unknown',
+                category: info?.category || 'Uncategorized',
+                team: info?.team || 'Unassigned',
+                sessions: Number(row.sessions || 0),
+                users: Number(row.users || 0),
+                pageviews: Number(row.pageviews || 0),
+                engagement_rate: Number(row.engagement_rate || 0),
+                recurring_users: Number(row.recurring_users || 0),
+                new_users: Number(row.new_users || 0),
+                event_count: Number(row.event_count || 0),
+            });
         }
+
+        // Group by team
+        const teamGroups = new Map<string, {
+            pages: typeof enrichedRows;
+            totals: { sessions: number; users: number; pageviews: number; engagement_rate_sum: number; engagement_rate_count: number; recurring_users: number; new_users: number; event_count: number };
+        }>();
+
+        for (const row of enrichedRows) {
+            if (!teamGroups.has(row.team)) {
+                teamGroups.set(row.team, {
+                    pages: [],
+                    totals: { sessions: 0, users: 0, pageviews: 0, engagement_rate_sum: 0, engagement_rate_count: 0, recurring_users: 0, new_users: 0, event_count: 0 },
+                });
+            }
+            const group = teamGroups.get(row.team)!;
+            group.pages.push(row);
+            group.totals.sessions += row.sessions;
+            group.totals.users += row.users;
+            group.totals.pageviews += row.pageviews;
+            group.totals.engagement_rate_sum += row.engagement_rate;
+            group.totals.engagement_rate_count += 1;
+            group.totals.recurring_users += row.recurring_users;
+            group.totals.new_users += row.new_users;
+            group.totals.event_count += row.event_count;
+        }
+
+        const csvRows: string[] = [
+            'Page Name,Category,Team,Sessions,Users,Pageviews,Engagement Rate,Recurring Users,New Users,Event Count',
+        ];
+
+        let grandTotal = { sessions: 0, users: 0, pageviews: 0, engagement_rate_sum: 0, engagement_rate_count: 0, recurring_users: 0, new_users: 0, event_count: 0 };
+
+        for (const [team, group] of teamGroups) {
+            const t = group.totals;
+            grandTotal.sessions += t.sessions;
+            grandTotal.users += t.users;
+            grandTotal.pageviews += t.pageviews;
+            grandTotal.engagement_rate_sum += t.engagement_rate_sum;
+            grandTotal.engagement_rate_count += t.engagement_rate_count;
+            grandTotal.recurring_users += t.recurring_users;
+            grandTotal.new_users += t.new_users;
+            grandTotal.event_count += t.event_count;
+
+            const avgEngRate = t.engagement_rate_count > 0 ? t.engagement_rate_sum / t.engagement_rate_count : 0;
+
+            // Team subtotal row
+            csvRows.push([
+                this.escapeCSV(`${team} (Total)`),
+                '',
+                this.escapeCSV(team),
+                t.sessions,
+                t.users,
+                t.pageviews,
+                `${avgEngRate.toFixed(2)}%`,
+                t.recurring_users,
+                t.new_users,
+                t.event_count,
+            ].join(','));
+
+            // Individual page rows
+            for (const row of group.pages) {
+                csvRows.push([
+                    this.escapeCSV(`  ${row.pageName}`),
+                    this.escapeCSV(row.category),
+                    this.escapeCSV(row.team),
+                    row.sessions,
+                    row.users,
+                    row.pageviews,
+                    `${row.engagement_rate.toFixed(2)}%`,
+                    row.recurring_users,
+                    row.new_users,
+                    row.event_count,
+                ].join(','));
+            }
+        }
+
+        // Grand total row
+        const grandAvgEngRate = grandTotal.engagement_rate_count > 0 ? grandTotal.engagement_rate_sum / grandTotal.engagement_rate_count : 0;
+        csvRows.push([
+            'Grand Total',
+            '',
+            '',
+            grandTotal.sessions,
+            grandTotal.users,
+            grandTotal.pageviews,
+            `${grandAvgEngRate.toFixed(2)}%`,
+            grandTotal.recurring_users,
+            grandTotal.new_users,
+            grandTotal.event_count,
+        ].join(','));
 
         return csvRows.join('\n');
     }
@@ -344,6 +434,48 @@ export class CsvGeneratorService {
             `Messages,${currentMessages.toLocaleString()},${calcChange(currentMessages, prevMessages)}`,
             `Revenue,$${currentRevenue.toFixed(2)},${calcChange(currentRevenue, prevRevenue)}`,
         ];
+
+        // ── Revenue by Team section ──
+        const currentTeamRevenue = await this.dailyRevenueRepo
+            .createQueryBuilder('dr')
+            .select([
+                'rm.team AS "team"',
+                'SUM(dr.totalRevenue) AS "total"',
+            ])
+            .innerJoin(RevenueMapping, 'rm', 'rm.pageId = dr.pageId')
+            .where('dr.date >= :startDate', { startDate })
+            .andWhere('dr.date <= :endDate', { endDate })
+            .groupBy('rm.team')
+            .orderBy('"team"', 'ASC')
+            .getRawMany();
+
+        const prevTeamRevenue = await this.dailyRevenueRepo
+            .createQueryBuilder('dr')
+            .select([
+                'rm.team AS "team"',
+                'SUM(dr.totalRevenue) AS "total"',
+            ])
+            .innerJoin(RevenueMapping, 'rm', 'rm.pageId = dr.pageId')
+            .where('dr.date >= :startDate', { startDate: prevStartStr })
+            .andWhere('dr.date <= :endDate', { endDate: prevEndStr })
+            .groupBy('rm.team')
+            .orderBy('"team"', 'ASC')
+            .getRawMany();
+
+        const prevTeamMap = new Map<string, number>();
+        for (const row of prevTeamRevenue) {
+            prevTeamMap.set(row.team || 'Unassigned', Number(row.total || 0));
+        }
+
+        csvRows.push('');
+        csvRows.push('Revenue by Team,Value,Change (%)');
+
+        for (const row of currentTeamRevenue) {
+            const team = row.team || 'Unassigned';
+            const curTotal = Number(row.total || 0);
+            const prevTotal = prevTeamMap.get(team) || 0;
+            csvRows.push(`${this.escapeCSV(team)},$${curTotal.toFixed(2)},${calcChange(curTotal, prevTotal)}`);
+        }
 
         return csvRows.join('\n');
     }

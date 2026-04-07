@@ -160,11 +160,14 @@ export class EmailReportsService {
 
             const fromAddr = process.env.SMTP_FROM || process.env.SMTP_USER || 'reports@studio.local';
 
+            // Parse revenue data for inline HTML table
+            const revenueData = this.parseRevenueCSV(revenueCSV);
+
             await this.transporter.sendMail({
                 from: fromAddr,
                 to: toList,
                 subject: `📊 ${typeLabel} Report — ${dateLabel} | ES Studio`,
-                html: this.buildEmailHtml(typeLabel, dateLabel, trafficCSV, revenueCSV, metaCSV),
+                html: this.buildEmailHtml(typeLabel, dateLabel, trafficCSV, revenueCSV, metaCSV, revenueData),
                 attachments,
             });
 
@@ -183,16 +186,113 @@ export class EmailReportsService {
     // HTML EMAIL TEMPLATE
     // ═══════════════════════════════════════════════════════
 
+    private parseRevenueCSV(csv: string): {
+        teams: { name: string; bonus: string; photo: string; reel: string; story: string; text: string; total: string; pages: { name: string; bonus: string; photo: string; reel: string; story: string; text: string; total: string }[] }[];
+        grandTotal: { bonus: string; photo: string; reel: string; story: string; text: string; total: string };
+    } {
+        const lines = csv.split('\n');
+        const teams: any[] = [];
+        let grandTotal = { bonus: '$0.00', photo: '$0.00', reel: '$0.00', story: '$0.00', text: '$0.00', total: '$0.00' };
+        let currentTeam: any = null;
+
+        for (let i = 1; i < lines.length; i++) {
+            const line = lines[i];
+            if (!line.trim()) continue;
+
+            // Parse CSV line (handle quoted fields)
+            const cols = this.parseCSVLine(line);
+            const label = cols[0] || '';
+
+            if (label === 'Grand Total') {
+                grandTotal = { bonus: cols[1], photo: cols[2], reel: cols[3], story: cols[4], text: cols[5], total: cols[6] };
+            } else if (label.endsWith('(Total)')) {
+                // Team total row
+                currentTeam = {
+                    name: label.replace(' (Total)', '').trim(),
+                    bonus: cols[1], photo: cols[2], reel: cols[3], story: cols[4], text: cols[5], total: cols[6],
+                    pages: [],
+                };
+                teams.push(currentTeam);
+            } else if (currentTeam && label.startsWith('  ')) {
+                // Page row (indented)
+                currentTeam.pages.push({
+                    name: label.trim(),
+                    bonus: cols[1], photo: cols[2], reel: cols[3], story: cols[4], text: cols[5], total: cols[6],
+                });
+            }
+        }
+        return { teams, grandTotal };
+    }
+
+    private parseCSVLine(line: string): string[] {
+        const result: string[] = [];
+        let current = '';
+        let inQuotes = false;
+        for (let i = 0; i < line.length; i++) {
+            const ch = line[i];
+            if (inQuotes) {
+                if (ch === '"' && line[i + 1] === '"') {
+                    current += '"';
+                    i++;
+                } else if (ch === '"') {
+                    inQuotes = false;
+                } else {
+                    current += ch;
+                }
+            } else if (ch === '"') {
+                inQuotes = true;
+            } else if (ch === ',') {
+                result.push(current);
+                current = '';
+            } else {
+                current += ch;
+            }
+        }
+        result.push(current);
+        return result;
+    }
+
     private buildEmailHtml(
         typeLabel: string,
         dateLabel: string,
         trafficCSV: string,
         revenueCSV: string,
         metaCSV: string,
+        revenueData: ReturnType<typeof EmailReportsService.prototype.parseRevenueCSV>,
     ): string {
         const trafficRows = trafficCSV.split('\n').length - 1;
-        const revenueRows = revenueCSV.split('\n').length - 1;
         const metaRows = metaCSV.split('\n').length - 1;
+
+        // Build revenue table rows
+        let revenueTableRows = '';
+        for (const team of revenueData.teams) {
+            // Team header row
+            revenueTableRows += `
+              <tr style="background:#f3f4f6;">
+                <td style="padding:10px 12px;font-weight:700;color:#111827;font-size:13px;border-bottom:1px solid #e5e7eb;">${team.name}</td>
+                <td style="padding:10px 8px;text-align:right;font-weight:600;color:#374151;font-size:12px;border-bottom:1px solid #e5e7eb;">${team.bonus}</td>
+                <td style="padding:10px 8px;text-align:right;font-weight:600;color:#374151;font-size:12px;border-bottom:1px solid #e5e7eb;">${team.photo}</td>
+                <td style="padding:10px 8px;text-align:right;font-weight:600;color:#374151;font-size:12px;border-bottom:1px solid #e5e7eb;">${team.reel}</td>
+                <td style="padding:10px 8px;text-align:right;font-weight:600;color:#374151;font-size:12px;border-bottom:1px solid #e5e7eb;">${team.story}</td>
+                <td style="padding:10px 8px;text-align:right;font-weight:600;color:#374151;font-size:12px;border-bottom:1px solid #e5e7eb;">${team.text}</td>
+                <td style="padding:10px 8px;text-align:right;font-weight:700;color:#059669;font-size:12px;border-bottom:1px solid #e5e7eb;">${team.total}</td>
+              </tr>`;
+            // Page rows
+            for (const page of team.pages) {
+                revenueTableRows += `
+              <tr>
+                <td style="padding:7px 12px 7px 28px;color:#6b7280;font-size:12px;border-bottom:1px solid #f3f4f6;">${page.name}</td>
+                <td style="padding:7px 8px;text-align:right;color:#6b7280;font-size:12px;border-bottom:1px solid #f3f4f6;">${page.bonus}</td>
+                <td style="padding:7px 8px;text-align:right;color:#6b7280;font-size:12px;border-bottom:1px solid #f3f4f6;">${page.photo}</td>
+                <td style="padding:7px 8px;text-align:right;color:#6b7280;font-size:12px;border-bottom:1px solid #f3f4f6;">${page.reel}</td>
+                <td style="padding:7px 8px;text-align:right;color:#6b7280;font-size:12px;border-bottom:1px solid #f3f4f6;">${page.story}</td>
+                <td style="padding:7px 8px;text-align:right;color:#6b7280;font-size:12px;border-bottom:1px solid #f3f4f6;">${page.text}</td>
+                <td style="padding:7px 8px;text-align:right;color:#059669;font-size:12px;border-bottom:1px solid #f3f4f6;">${page.total}</td>
+              </tr>`;
+            }
+        }
+
+        const gt = revenueData.grandTotal;
 
         return `
 <!DOCTYPE html>
@@ -201,11 +301,12 @@ export class EmailReportsService {
   <meta charset="utf-8">
   <style>
     body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; background: #f8f9fa; margin: 0; padding: 0; }
-    .container { max-width: 560px; margin: 0 auto; padding: 32px 16px; }
-    .card { background: #fff; border-radius: 12px; padding: 32px; border: 1px solid #e5e7eb; }
+    .container { max-width: 720px; margin: 0 auto; padding: 32px 16px; }
+    .card { background: #fff; border-radius: 12px; padding: 32px; border: 1px solid #e5e7eb; margin-bottom: 16px; }
     h1 { font-size: 20px; color: #111827; margin: 0 0 4px 0; }
+    h2 { font-size: 16px; color: #111827; margin: 0 0 16px 0; }
     .subtitle { font-size: 13px; color: #6b7280; margin: 0 0 24px 0; }
-    .attachment-card { background: #f9fafb; border: 1px solid #e5e7eb; border-radius: 8px; padding: 14px 16px; margin-bottom: 10px; display: flex; justify-content: space-between; align-items: center; }
+    .attachment-card { background: #f9fafb; border: 1px solid #e5e7eb; border-radius: 8px; padding: 14px 16px; margin-bottom: 10px; }
     .attachment-name { font-size: 13px; font-weight: 600; color: #374151; }
     .attachment-meta { font-size: 11px; color: #9ca3af; }
     .footer { text-align: center; padding: 20px 0 0; font-size: 11px; color: #9ca3af; }
@@ -216,29 +317,55 @@ export class EmailReportsService {
     <div class="card">
       <h1>📊 ${typeLabel} Report</h1>
       <p class="subtitle">${dateLabel}</p>
-      
+
       <div class="attachment-card">
-        <div>
-          <div class="attachment-name">📈 Traffic Report</div>
-          <div class="attachment-meta">${trafficRows} page(s) tracked</div>
-        </div>
+        <div class="attachment-name">📈 Traffic Report</div>
+        <div class="attachment-meta">${trafficRows} page(s) tracked</div>
       </div>
-      
+
       <div class="attachment-card">
-        <div>
-          <div class="attachment-name">💰 Revenue Report</div>
-          <div class="attachment-meta">${revenueRows} row(s)</div>
-        </div>
+        <div class="attachment-name">💰 Revenue Report</div>
+        <div class="attachment-meta">${revenueData.teams.length} team(s), ${revenueData.teams.reduce((s, t) => s + t.pages.length, 0)} page(s)</div>
       </div>
-      
+
       <div class="attachment-card">
-        <div>
-          <div class="attachment-name">📱 Meta Overview</div>
-          <div class="attachment-meta">${metaRows} metric(s)</div>
-        </div>
+        <div class="attachment-name">📱 Meta Overview</div>
+        <div class="attachment-meta">${metaRows} metric(s)</div>
       </div>
     </div>
-    
+
+    <!-- Revenue Breakdown Table -->
+    <div class="card" style="padding:24px;">
+      <h2>💰 Revenue Breakdown — Page Wise</h2>
+      <table width="100%" cellpadding="0" cellspacing="0" style="border-collapse:collapse;border:1px solid #e5e7eb;border-radius:8px;overflow:hidden;">
+        <thead>
+          <tr style="background:#f9fafb;">
+            <th style="padding:10px 12px;text-align:left;font-size:12px;font-weight:600;color:#6b7280;border-bottom:2px solid #e5e7eb;">Team / Page</th>
+            <th style="padding:10px 8px;text-align:right;font-size:12px;font-weight:600;color:#6b7280;border-bottom:2px solid #e5e7eb;">Bonus</th>
+            <th style="padding:10px 8px;text-align:right;font-size:12px;font-weight:600;color:#6b7280;border-bottom:2px solid #e5e7eb;">Photo</th>
+            <th style="padding:10px 8px;text-align:right;font-size:12px;font-weight:600;color:#6b7280;border-bottom:2px solid #e5e7eb;">Reel</th>
+            <th style="padding:10px 8px;text-align:right;font-size:12px;font-weight:600;color:#6b7280;border-bottom:2px solid #e5e7eb;">Story</th>
+            <th style="padding:10px 8px;text-align:right;font-size:12px;font-weight:600;color:#6b7280;border-bottom:2px solid #e5e7eb;">Text</th>
+            <th style="padding:10px 8px;text-align:right;font-size:12px;font-weight:600;color:#059669;border-bottom:2px solid #e5e7eb;">Total</th>
+          </tr>
+        </thead>
+        <tbody>
+          ${revenueTableRows}
+          <!-- Grand Total -->
+          <tr style="background:#f0fdf4;border-top:2px solid #d1d5db;">
+            <td style="padding:12px;font-weight:700;color:#111827;font-size:13px;">Grand Total</td>
+            <td style="padding:12px 8px;text-align:right;font-weight:700;color:#374151;font-size:12px;">${gt.bonus}</td>
+            <td style="padding:12px 8px;text-align:right;font-weight:700;color:#374151;font-size:12px;">${gt.photo}</td>
+            <td style="padding:12px 8px;text-align:right;font-weight:700;color:#374151;font-size:12px;">${gt.reel}</td>
+            <td style="padding:12px 8px;text-align:right;font-weight:700;color:#374151;font-size:12px;">${gt.story}</td>
+            <td style="padding:12px 8px;text-align:right;font-weight:700;color:#374151;font-size:12px;">${gt.text}</td>
+            <td style="padding:12px 8px;text-align:right;font-weight:700;color:#059669;font-size:13px;">${gt.total}</td>
+          </tr>
+        </tbody>
+      </table>
+      <p style="font-size:11px;color:#9ca3af;margin:12px 0 0;text-align:center;">Full data available in attached CSV files</p>
+    </div>
+
     <div class="footer">
       ES Studio Analytics — Automated Report
     </div>

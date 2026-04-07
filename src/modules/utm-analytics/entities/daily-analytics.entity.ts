@@ -16,6 +16,7 @@ export class DailyAnalytics {
   @Column({ default: '(direct)' })
   utmSource: string;
 
+  @Index()
   @Column({ default: '(none)' })
   utmMedium: string;
 

@@ -4,9 +4,11 @@ import {
   PrimaryColumn,
   CreateDateColumn,
   UpdateDateColumn,
+  Index,
 } from 'typeorm';
 
 @Entity('social_posts')
+@Index(['profileId', 'postedAt'])
 export class SocialPost {
   @PrimaryColumn()
   postId: string;

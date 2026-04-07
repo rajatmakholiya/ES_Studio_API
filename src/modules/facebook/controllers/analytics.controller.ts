@@ -17,6 +17,10 @@ import {
   fetchDailyRevenue,
 } from '../services/meta.service';
 
+/** Safety cap for profileIds arrays to avoid unbounded IN clauses */
+const MAX_PROFILE_IDS = 50;
+const DEBUG_LIMIT = 200;
+
 @Controller('api/analytics')
 export class AnalyticsController {
   constructor(
@@ -70,6 +74,10 @@ export class AnalyticsController {
     }
   }
 
+  /**
+   * OPTIMIZED: Replaced N+1 loop with a single DISTINCT ON query that fetches
+   * the latest demographic row per profile in one round-trip.
+   */
   @Post('demographics/aggregate')
   async getAggregatedDemographics(
     @Body() body: { profileIds: string[] },
@@ -85,35 +93,45 @@ export class AnalyticsController {
         });
       }
 
+      const safeIds = profileIds.slice(0, MAX_PROFILE_IDS);
+
+      // Single query: get latest demographic per profile using DISTINCT ON
+      const latestDemos: DemographicSnapshot[] = await this.demographicRepo
+        .createQueryBuilder('d')
+        .where(
+          'd."profileId" IN (:...ids)',
+          { ids: safeIds },
+        )
+        .andWhere(
+          `d.id IN (
+            SELECT DISTINCT ON (sub."profileId") sub.id
+            FROM demographic_snapshots sub
+            WHERE sub."profileId" IN (:...ids)
+            ORDER BY sub."profileId", sub.date DESC
+          )`,
+          { ids: safeIds },
+        )
+        .getMany();
+
       const aggregated = {
         genderAge: {} as Record<string, number>,
         topCities: {} as Record<string, number>,
         topCountries: {} as Record<string, number>,
       };
 
-      for (const pid of profileIds) {
-        const demo = await this.demographicRepo.findOne({
-          where: { profileId: pid },
-          order: { date: 'DESC' },
-        });
-
-        if (!demo) continue;
-
-        // Aggregate gender/age
+      for (const demo of latestDemos) {
         if (demo.genderAge) {
           for (const [key, val] of Object.entries(demo.genderAge)) {
             aggregated.genderAge[key] =
               (aggregated.genderAge[key] || 0) + Number(val);
           }
         }
-        // Aggregate cities
         if (demo.topCities) {
           for (const [key, val] of Object.entries(demo.topCities)) {
             aggregated.topCities[key] =
               (aggregated.topCities[key] || 0) + Number(val);
           }
         }
-        // Aggregate countries
         if (demo.topCountries) {
           for (const [key, val] of Object.entries(demo.topCountries)) {
             aggregated.topCountries[key] =
@@ -128,6 +146,10 @@ export class AnalyticsController {
     }
   }
 
+  /**
+   * OPTIMIZED: Aggregate snapshots and posts at DB level instead of loading
+   * all rows into memory. Only the latest snapshot + aggregated totals are fetched.
+   */
   @Get(':profileId/data')
   async getSmartAnalytics(
     @Param('profileId') profileId: string,
@@ -135,7 +157,7 @@ export class AnalyticsController {
     @Res() res: Response,
   ) {
     try {
-      const days = parseInt(daysStr) || 30;
+      const days = Math.min(parseInt(daysStr) || 30, 365);
       const end = new Date();
       const start = new Date();
       start.setDate(start.getDate() - days);
@@ -144,29 +166,25 @@ export class AnalyticsController {
       const profile = await this.profileRepo.findOne({ where: { profileId } });
       if (!profile) return res.status(404).json({ error: 'Profile not found' });
 
-      const dailySnapshots = await this.snapshotRepo.find({
-        where: { profileId, date: MoreThanOrEqual(startStr) },
-        order: { date: 'ASC' },
-      });
+      // DB-level aggregation for total engagements from posts
+      const postAgg: { totalEngagements: string } | undefined =
+        await this.postRepo
+          .createQueryBuilder('p')
+          .select(
+            'COALESCE(SUM(p.likes + p.comments + p.shares + p.clicks), 0)',
+            'totalEngagements',
+          )
+          .where('p."profileId" = :profileId', { profileId })
+          .andWhere('p."postedAt" >= :start', { start })
+          .getRawOne();
 
-      const recentPosts = await this.postRepo.find({
-        where: { profileId, postedAt: MoreThanOrEqual(start) },
-        order: { postedAt: 'DESC' },
-      });
+      const totalEngagements = Number(postAgg?.totalEngagements || 0);
 
-      const totalEngagements = recentPosts.reduce(
-        (sum, p) =>
-          sum +
-          Number(p.likes) +
-          Number(p.comments) +
-          Number(p.shares) +
-          Number(p.clicks),
-        0,
-      );
-
+      // Latest follower count (single row)
       const absoluteLatestSnap = await this.snapshotRepo.findOne({
         where: { profileId },
         order: { date: 'DESC' },
+        select: ['totalFollowers'],
       });
       const followers = absoluteLatestSnap
         ? absoluteLatestSnap.totalFollowers
@@ -176,6 +194,19 @@ export class AnalyticsController {
         followers > 0
           ? ((totalEngagements / followers) * 100).toFixed(2) + '%'
           : '0.00%';
+
+      // Snapshots: still needed for the chart, but bounded by days
+      const dailySnapshots = await this.snapshotRepo.find({
+        where: { profileId, date: MoreThanOrEqual(startStr) },
+        order: { date: 'ASC' },
+      });
+
+      // Posts: bounded by date range, limited to 500 for safety
+      const recentPosts = await this.postRepo.find({
+        where: { profileId, postedAt: MoreThanOrEqual(start) },
+        order: { postedAt: 'DESC' },
+        take: 500,
+      });
 
       return res.status(200).json({
         isFetchingHistorical: profile.syncState === 'SYNCING',
@@ -213,6 +244,9 @@ export class AnalyticsController {
     }
   }
 
+  /**
+   * OPTIMIZED: Added LIMIT to both snapshots and posts queries.
+   */
   @Get('debug/:profileId')
   async getDebugData(
     @Param('profileId') profileId: string,
@@ -227,21 +261,29 @@ export class AnalyticsController {
         return res.status(404).json({ error: 'Profile not found' });
       }
 
-      const snapshots = await this.snapshotRepo.find({
-        where: { profileId },
-        order: { date: 'DESC' },
-      });
+      const [snapshotCount, postCount] = await Promise.all([
+        this.snapshotRepo.count({ where: { profileId } }),
+        this.postRepo.count({ where: { profileId } }),
+      ]);
 
-      const posts = await this.postRepo.find({
-        where: { profileId },
-        order: { postedAt: 'DESC' },
-      });
+      const [snapshots, posts] = await Promise.all([
+        this.snapshotRepo.find({
+          where: { profileId },
+          order: { date: 'DESC' },
+          take: DEBUG_LIMIT,
+        }),
+        this.postRepo.find({
+          where: { profileId },
+          order: { postedAt: 'DESC' },
+          take: DEBUG_LIMIT,
+        }),
+      ]);
 
       return res.status(200).json({
         debug_info: `Raw DB Data for ${profile.name} (${profile.platform})`,
         profile_record: profile,
-        total_snapshots_in_db: snapshots.length,
-        total_posts_in_db: posts.length,
+        total_snapshots_in_db: snapshotCount,
+        total_posts_in_db: postCount,
         raw_snapshots: snapshots,
         raw_posts: posts,
       });
@@ -250,6 +292,14 @@ export class AnalyticsController {
     }
   }
 
+  /**
+   * OPTIMIZED: The main reports endpoint.
+   * - Snapshots aggregated at DB level with GROUP BY date
+   * - Posts aggregated at DB level with GROUP BY date
+   * - Previous period aggregated at DB level with SUM
+   * - Latest follower counts fetched with a single DISTINCT ON query
+   * - No large arrays loaded into Node.js memory
+   */
   @Post('aggregate')
   async getAggregatedData(
     @Body()
@@ -265,6 +315,8 @@ export class AnalyticsController {
       const { profileIds, days = 30, startDate, endDate } = body;
       if (!profileIds || profileIds.length === 0)
         return res.status(200).json({ timeSeries: [], totals: null });
+
+      const safeIds = profileIds.slice(0, MAX_PROFILE_IDS);
 
       let currentEnd: Date;
       let currentStart: Date;
@@ -286,8 +338,10 @@ export class AnalyticsController {
       const prevStart = new Date(currentStart.getTime() - timeDiff);
       const prevStartStr = prevStart.toISOString().split('T')[0];
 
+      // --- Background sync check (unchanged logic, already lightweight) ---
       const profilesToSync = await this.profileRepo.find({
-        where: { profileId: In(profileIds), isActive: true },
+        where: { profileId: In(safeIds), isActive: true },
+        select: ['profileId', 'syncState'],
       });
       const expectedDays =
         Math.floor(
@@ -303,7 +357,6 @@ export class AnalyticsController {
         });
 
         if (existingCount < expectedDays - 2) {
-          // Instead of a heavy blocking sync inline, offload to background
           if (profile.syncState !== 'SYNCING') {
             await this.profileRepo.update(
               { profileId: profile.profileId },
@@ -317,238 +370,346 @@ export class AnalyticsController {
         }
       }
 
-      // FETCH DATA FROM DATABASE
-      const snapshots = await this.snapshotRepo.find({
-        where: {
-          profileId: In(profileIds),
-          date: Between(prevStartStr, currentEndStr),
-        },
-        order: { date: 'ASC' },
-      });
+      // --- CURRENT PERIOD: Snapshot aggregation at DB level (GROUP BY date) ---
+      const currentSnapshotAgg: {
+        date: string;
+        followersGained: string;
+        unfollows: string;
+        impressions: string;
+        engagements: string;
+        pageViews: string;
+        messages: string;
+        videoViews: string;
+        revenue: string;
+      }[] = await this.snapshotRepo
+        .createQueryBuilder('s')
+        .select('s.date', 'date')
+        .addSelect('COALESCE(SUM(s."followersGained"), 0)', 'followersGained')
+        .addSelect('COALESCE(SUM(s.unfollows), 0)', 'unfollows')
+        .addSelect(
+          'COALESCE(SUM(GREATEST(s."totalImpressions", s."totalReach")), 0)',
+          'impressions',
+        )
+        .addSelect('COALESCE(SUM(s."totalEngagement"), 0)', 'engagements')
+        .addSelect('COALESCE(SUM(s."pageViews"), 0)', 'pageViews')
+        .addSelect('COALESCE(SUM(s."netMessages"), 0)', 'messages')
+        .addSelect(
+          `COALESCE(SUM(CASE WHEN s.platform = 'facebook' THEN s."videoViews" ELSE 0 END), 0)`,
+          'videoViews',
+        )
+        .addSelect('COALESCE(SUM(s.revenue), 0)', 'revenue')
+        .where('s."profileId" IN (:...ids)', { ids: safeIds })
+        .andWhere('s.date >= :start', { start: currentStartStr })
+        .andWhere('s.date <= :end', { end: currentEndStr })
+        .groupBy('s.date')
+        .orderBy('s.date', 'ASC')
+        .getRawMany();
 
-      const normalizeDate = (d: any) => {
-        if (!d) return '';
-        if (typeof d === 'string') return d.split('T')[0];
-        return new Date(d).toISOString().split('T')[0];
-      };
+      // --- CURRENT PERIOD: Post aggregation at DB level (GROUP BY date) ---
+      const currentPostAgg: {
+        postDate: string;
+        engagements: string;
+        fbImpressions: string;
+        igImpressions: string;
+        igVideoViews: string;
+      }[] = await this.postRepo
+        .createQueryBuilder('p')
+        .select(`TO_CHAR(p."postedAt", 'YYYY-MM-DD')`, 'postDate')
+        .addSelect(
+          'COALESCE(SUM(p.likes + p.comments + p.shares + p.clicks), 0)',
+          'engagements',
+        )
+        .addSelect(
+          `COALESCE(SUM(CASE WHEN p.platform = 'facebook' THEN p.reach ELSE 0 END), 0)`,
+          'fbImpressions',
+        )
+        .addSelect(
+          `COALESCE(SUM(CASE WHEN p.platform = 'instagram' THEN p.views + p.reach ELSE 0 END), 0)`,
+          'igImpressions',
+        )
+        .addSelect(
+          `COALESCE(SUM(CASE WHEN p.platform = 'instagram' THEN p.views ELSE 0 END), 0)`,
+          'igVideoViews',
+        )
+        .where('p."profileId" IN (:...ids)', { ids: safeIds })
+        .andWhere('p."postedAt" >= :start', { start: currentStart })
+        .andWhere('p."postedAt" <= :end', { end: currentEnd })
+        .groupBy(`TO_CHAR(p."postedAt", 'YYYY-MM-DD')`)
+        .getRawMany();
 
-      const currentSnapshots = snapshots.filter((s) => {
-        const d = normalizeDate(s.date);
-        return d >= currentStartStr && d <= currentEndStr;
-      });
+      // Build post-aggregation lookup
+      const postAggByDate: Record<
+        string,
+        {
+          engagements: number;
+          fbImpressions: number;
+          igImpressions: number;
+          igVideoViews: number;
+        }
+      > = {};
+      for (const row of currentPostAgg) {
+        postAggByDate[row.postDate] = {
+          engagements: Number(row.engagements),
+          fbImpressions: Number(row.fbImpressions),
+          igImpressions: Number(row.igImpressions),
+          igVideoViews: Number(row.igVideoViews),
+        };
+      }
 
-      const prevSnapshots = snapshots.filter((s) => {
-        const d = normalizeDate(s.date);
-        return d >= prevStartStr && d < currentStartStr;
-      });
+      // Build snapshot-aggregation lookup
+      const snapAggByDate: Record<string, (typeof currentSnapshotAgg)[0]> = {};
+      for (const row of currentSnapshotAgg) {
+        const d =
+          typeof row.date === 'string'
+            ? row.date.split('T')[0]
+            : new Date(row.date).toISOString().split('T')[0];
+        snapAggByDate[d] = row;
+      }
 
-      const currentPosts = await this.postRepo.find({
-        where: {
-          profileId: In(profileIds),
-          postedAt: Between(currentStart, currentEnd),
-        },
-      });
-      const prevPosts = await this.postRepo.find({
-        where: {
-          profileId: In(profileIds),
-          postedAt: Between(prevStart, currentStart),
-        },
-      });
-
-      const timeSeriesMap: Record<string, any> = {};
-      let dIter = new Date(currentStart);
+      // --- Build time series (lightweight: iterate date range, merge pre-aggregated maps) ---
+      const timeSeries: any[] = [];
+      const dIter = new Date(currentStart);
 
       while (dIter <= currentEnd) {
         const dStr = dIter.toISOString().split('T')[0];
-        timeSeriesMap[dStr] = {
+
+        const snap = snapAggByDate[dStr];
+        const post = postAggByDate[dStr];
+
+        const followersGained = Number(snap?.followersGained || 0);
+        const unfollows = Number(snap?.unfollows || 0);
+        const snapImpressions = Number(snap?.impressions || 0);
+        const snapEngagements = Number(snap?.engagements || 0);
+        const snapVideoViews = Number(snap?.videoViews || 0);
+
+        const postEngagements = post?.engagements || 0;
+        const postFbImpressions = post?.fbImpressions || 0;
+        const postIgImpressions = post?.igImpressions || 0;
+        const postIgVideoViews = post?.igVideoViews || 0;
+
+        const totalImpressions =
+          snapImpressions + postFbImpressions + postIgImpressions;
+        const totalEngagements = snapEngagements + postEngagements;
+        const totalVideoViews = snapVideoViews + postIgVideoViews;
+
+        timeSeries.push({
           date: dStr,
-          followersGained: 0,
-          unfollows: 0,
-          netFollowers: 0,
-          totalAudience: 0,
-          impressions: 0,
-          engagements: 0,
-          pageViews: 0,
-          messages: 0,
-          videoViews: 0,
-          engagementRate: 0,
-          revenue: 0,
-        };
+          followersGained,
+          unfollows,
+          netFollowers: followersGained - unfollows,
+          totalAudience: 0, // filled below
+          impressions: totalImpressions,
+          engagements: totalEngagements,
+          pageViews: Number(snap?.pageViews || 0),
+          messages: Number(snap?.messages || 0),
+          videoViews: totalVideoViews,
+          engagementRate:
+            totalImpressions > 0
+              ? Number(
+                  ((totalEngagements / totalImpressions) * 100).toFixed(1),
+                )
+              : 0,
+          revenue: Number(snap?.revenue || 0),
+        });
+
         dIter.setDate(dIter.getDate() + 1);
       }
 
-      currentSnapshots.forEach((snap) => {
-        const d = normalizeDate(snap.date);
-        if (timeSeriesMap[d]) {
-          timeSeriesMap[d].followersGained += Number(snap.followersGained || 0);
-          timeSeriesMap[d].unfollows += Number(snap.unfollows || 0);
-          timeSeriesMap[d].netFollowers +=
-            Number(snap.followersGained || 0) - Number(snap.unfollows || 0);
-          timeSeriesMap[d].impressions += Number(
-            snap.totalImpressions || snap.totalReach || 0,
-          );
-          timeSeriesMap[d].engagements += Number(snap.totalEngagement || 0);
-          timeSeriesMap[d].pageViews += Number(snap.pageViews || 0);
-          timeSeriesMap[d].messages += Number(snap.netMessages || 0);
-          timeSeriesMap[d].revenue += Number(snap.revenue || 0);
-
-          if (snap.platform === 'facebook') {
-            timeSeriesMap[d].videoViews += Number(snap.videoViews || 0);
-          }
-        }
-      });
-
-      currentPosts.forEach((post) => {
-        const postDateStr = new Date(post.postedAt).toISOString().split('T')[0];
-        if (timeSeriesMap[postDateStr]) {
-          const postEngagements =
-            Number(post.likes || 0) +
-            Number(post.comments || 0) +
-            Number(post.shares || 0) +
-            Number(post.clicks || 0);
-          timeSeriesMap[postDateStr].engagements += postEngagements;
-
-          if (post.platform === 'instagram') {
-            timeSeriesMap[postDateStr].videoViews += Number(post.views || 0);
-            timeSeriesMap[postDateStr].impressions +=
-              Number(post.views || 0) + Number(post.reach || 0);
-          } else if (post.platform === 'facebook') {
-            timeSeriesMap[postDateStr].impressions += Number(post.reach || 0);
-          }
-        }
-      });
-
-      const timeSeries = Object.values(timeSeriesMap).sort(
-        (a: any, b: any) =>
-          new Date(a.date).getTime() - new Date(b.date).getTime(),
-      );
+      // --- Audience tracking: get prior follower counts + daily follower snapshots ---
+      // Single query: latest snapshot BEFORE current period per profile
+      const priorFollowerRows: { profileId: string; totalFollowers: string }[] =
+        await this.snapshotRepo
+          .createQueryBuilder('s')
+          .select('s."profileId"', 'profileId')
+          .addSelect('s."totalFollowers"', 'totalFollowers')
+          .where(
+            `s.id IN (
+              SELECT DISTINCT ON (sub."profileId") sub.id
+              FROM analytics_snapshots sub
+              WHERE sub."profileId" IN (:...ids) AND sub.date < :start
+              ORDER BY sub."profileId", sub.date DESC
+            )`,
+            { ids: safeIds, start: currentStartStr },
+          )
+          .getRawMany();
 
       const latestFollowers: Record<string, number> = {};
-      for (const pid of profileIds) {
-        const priorSnap = await this.snapshotRepo.findOne({
-          where: { profileId: pid, date: LessThan(currentStartStr) },
-          order: { date: 'DESC' },
-        });
-        latestFollowers[pid] =
-          priorSnap && priorSnap.totalFollowers > 0
-            ? priorSnap.totalFollowers
-            : 0;
+      for (const pid of safeIds) {
+        latestFollowers[pid] = 0;
+      }
+      for (const row of priorFollowerRows) {
+        const val = Number(row.totalFollowers);
+        if (val > 0) latestFollowers[row.profileId] = val;
       }
 
-      timeSeries.forEach((day) => {
-        const daySnaps = currentSnapshots.filter(
-          (s) => normalizeDate(s.date) === day.date,
-        );
-        daySnaps.forEach((s) => {
-          if (s.totalFollowers > 0)
-            latestFollowers[s.profileId] = s.totalFollowers;
-        });
+      // Get daily totalFollowers per profile within current period (for running audience)
+      const dailyFollowerRows: {
+        date: string;
+        profileId: string;
+        totalFollowers: string;
+      }[] = await this.snapshotRepo
+        .createQueryBuilder('s')
+        .select('s.date', 'date')
+        .addSelect('s."profileId"', 'profileId')
+        .addSelect('s."totalFollowers"', 'totalFollowers')
+        .where('s."profileId" IN (:...ids)', { ids: safeIds })
+        .andWhere('s.date >= :start', { start: currentStartStr })
+        .andWhere('s.date <= :end', { end: currentEndStr })
+        .andWhere('s."totalFollowers" > 0')
+        .orderBy('s.date', 'ASC')
+        .getRawMany();
+
+      // Build a map: date -> { profileId -> totalFollowers }
+      const dailyFollowerMap: Record<string, Record<string, number>> = {};
+      for (const row of dailyFollowerRows) {
+        const d =
+          typeof row.date === 'string'
+            ? row.date.split('T')[0]
+            : new Date(row.date).toISOString().split('T')[0];
+        if (!dailyFollowerMap[d]) dailyFollowerMap[d] = {};
+        dailyFollowerMap[d][row.profileId] = Number(row.totalFollowers);
+      }
+
+      // Walk through timeSeries and compute running audience
+      for (const day of timeSeries) {
+        const dayFollowers = dailyFollowerMap[day.date];
+        if (dayFollowers) {
+          for (const [pid, val] of Object.entries(dayFollowers)) {
+            latestFollowers[pid] = val;
+          }
+        }
 
         let dailyAudience = 0;
-        profileIds.forEach((pid) => {
+        for (const pid of safeIds) {
           dailyAudience += latestFollowers[pid] || 0;
-        });
-        day.totalAudience = dailyAudience;
-
-        day.engagementRate =
-          day.impressions > 0
-            ? Number(((day.engagements / day.impressions) * 100).toFixed(1))
-            : 0;
-      });
-
-      let currentAudience = 0;
-      for (const pid of profileIds) {
-        const absoluteLatest = await this.snapshotRepo.findOne({
-          where: { profileId: pid },
-          order: { date: 'DESC' },
-        });
-        if (absoluteLatest && absoluteLatest.totalFollowers > 0) {
-          currentAudience += absoluteLatest.totalFollowers;
         }
+        day.totalAudience = dailyAudience;
       }
 
-      const currentNetGrowth = timeSeries.reduce(
-        (sum, s) => sum + Number(s.netFollowers || 0),
-        0,
-      );
-      const currentImpressions = timeSeries.reduce(
-        (sum, s) => sum + Number(s.impressions || 0),
-        0,
-      );
-      const currentVideoViews = timeSeries.reduce(
-        (sum, s) => sum + Number(s.videoViews || 0),
-        0,
-      );
-      const currentEngagements = timeSeries.reduce(
-        (sum, s) => sum + Number(s.engagements || 0),
-        0,
-      );
-      const currentPageViews = timeSeries.reduce(
-        (sum, s) => sum + Number(s.pageViews || 0),
-        0,
-      );
-      const currentMessages = timeSeries.reduce(
-        (sum, s) => sum + Number(s.messages || 0),
-        0,
-      );
-      const currentRevenue = timeSeries.reduce(
-        (sum, s) => sum + Number(s.revenue || 0),
-        0,
-      );
+      // --- Current audience: single query with DISTINCT ON ---
+      const absoluteLatestRows: {
+        profileId: string;
+        totalFollowers: string;
+      }[] = await this.snapshotRepo
+        .createQueryBuilder('s')
+        .select('s."profileId"', 'profileId')
+        .addSelect('s."totalFollowers"', 'totalFollowers')
+        .where(
+          `s.id IN (
+            SELECT DISTINCT ON (sub."profileId") sub.id
+            FROM analytics_snapshots sub
+            WHERE sub."profileId" IN (:...ids) AND sub."totalFollowers" > 0
+            ORDER BY sub."profileId", sub.date DESC
+          )`,
+          { ids: safeIds },
+        )
+        .getRawMany();
+
+      let currentAudience = 0;
+      for (const row of absoluteLatestRows) {
+        currentAudience += Number(row.totalFollowers);
+      }
+
+      // --- PREVIOUS PERIOD: aggregate at DB level ---
+      const prevSnapAgg: {
+        netGrowth: string;
+        engagements: string;
+        impressions: string;
+        fbVideoViews: string;
+        pageViews: string;
+        messages: string;
+        revenue: string;
+      } | undefined = await this.snapshotRepo
+        .createQueryBuilder('s')
+        .select(
+          'COALESCE(SUM(s."followersGained"), 0) - COALESCE(SUM(s.unfollows), 0)',
+          'netGrowth',
+        )
+        .addSelect('COALESCE(SUM(s."totalEngagement"), 0)', 'engagements')
+        .addSelect(
+          `COALESCE(SUM(GREATEST(s."totalImpressions", s."totalReach")), 0) + COALESCE(SUM(CASE WHEN s.platform = 'facebook' THEN s."videoViews" ELSE 0 END), 0)`,
+          'impressions',
+        )
+        .addSelect(
+          `COALESCE(SUM(CASE WHEN s.platform = 'facebook' THEN s."videoViews" ELSE 0 END), 0)`,
+          'fbVideoViews',
+        )
+        .addSelect('COALESCE(SUM(s."pageViews"), 0)', 'pageViews')
+        .addSelect('COALESCE(SUM(s."netMessages"), 0)', 'messages')
+        .addSelect('COALESCE(SUM(s.revenue), 0)', 'revenue')
+        .where('s."profileId" IN (:...ids)', { ids: safeIds })
+        .andWhere('s.date >= :start', { start: prevStartStr })
+        .andWhere('s.date < :end', { end: currentStartStr })
+        .getRawOne();
+
+      const prevPostAgg: {
+        engagements: string;
+        fbImpressions: string;
+        igImpressions: string;
+        igVideoViews: string;
+      } | undefined = await this.postRepo
+        .createQueryBuilder('p')
+        .select(
+          'COALESCE(SUM(p.likes + p.comments + p.shares + p.clicks), 0)',
+          'engagements',
+        )
+        .addSelect(
+          `COALESCE(SUM(CASE WHEN p.platform = 'facebook' THEN p.reach ELSE 0 END), 0)`,
+          'fbImpressions',
+        )
+        .addSelect(
+          `COALESCE(SUM(CASE WHEN p.platform = 'instagram' THEN p.views + p.reach ELSE 0 END), 0)`,
+          'igImpressions',
+        )
+        .addSelect(
+          `COALESCE(SUM(CASE WHEN p.platform = 'instagram' THEN p.views ELSE 0 END), 0)`,
+          'igVideoViews',
+        )
+        .where('p."profileId" IN (:...ids)', { ids: safeIds })
+        .andWhere('p."postedAt" >= :start', { start: prevStart })
+        .andWhere('p."postedAt" < :end', { end: currentStart })
+        .getRawOne();
+
+      // --- Compute current totals from timeSeries (already in memory, tiny array) ---
+      let currentNetGrowth = 0;
+      let currentImpressions = 0;
+      let currentVideoViews = 0;
+      let currentEngagements = 0;
+      let currentPageViews = 0;
+      let currentMessages = 0;
+      let currentRevenue = 0;
+
+      for (const s of timeSeries) {
+        currentNetGrowth += s.netFollowers;
+        currentImpressions += s.impressions;
+        currentVideoViews += s.videoViews;
+        currentEngagements += s.engagements;
+        currentPageViews += s.pageViews;
+        currentMessages += s.messages;
+        currentRevenue += s.revenue;
+      }
 
       const currentEngRate =
         currentImpressions > 0
           ? (currentEngagements / currentImpressions) * 100
           : 0;
 
-      const prevNetGrowth = prevSnapshots.reduce(
-        (sum, s) =>
-          sum + (Number(s.followersGained) || 0) - (Number(s.unfollows) || 0),
-        0,
-      );
+      // Previous period totals
+      const prevNetGrowth = Number(prevSnapAgg?.netGrowth || 0);
       const prevAudience = currentAudience - currentNetGrowth;
-
-      let prevEngagements = prevSnapshots.reduce(
-        (sum, s) => sum + (Number(s.totalEngagement) || 0),
-        0,
-      );
-      let prevImpressions = prevSnapshots.reduce(
-        (sum, s) =>
-          sum +
-          (Number(s.totalImpressions) || Number(s.totalReach) || 0) +
-          (s.platform === 'facebook' ? Number(s.videoViews) || 0 : 0),
-        0,
-      );
-      let prevVideoViews = prevSnapshots
-        .filter((s) => s.platform === 'facebook')
-        .reduce((sum, s) => sum + (Number(s.videoViews) || 0), 0);
-
-      prevPosts.forEach((p) => {
-        prevEngagements +=
-          Number(p.likes || 0) +
-          Number(p.comments || 0) +
-          Number(p.shares || 0) +
-          Number(p.clicks || 0);
-        if (p.platform === 'instagram') {
-          prevVideoViews += Number(p.views || 0);
-          prevImpressions += Number(p.views || 0) + Number(p.reach || 0);
-        } else if (p.platform === 'facebook') {
-          prevImpressions += Number(p.reach || 0);
-        }
-      });
-
-      const prevPageViews = prevSnapshots.reduce(
-        (sum, s) => sum + (Number(s.pageViews) || 0),
-        0,
-      );
-      const prevMessages = prevSnapshots.reduce(
-        (sum, s) => sum + (Number(s.netMessages) || 0),
-        0,
-      );
-      const prevRevenue = prevSnapshots.reduce(
-        (sum, s) => sum + (Number(s.revenue) || 0),
-        0,
-      );
+      const prevEngagements =
+        Number(prevSnapAgg?.engagements || 0) +
+        Number(prevPostAgg?.engagements || 0);
+      const prevImpressions =
+        Number(prevSnapAgg?.impressions || 0) +
+        Number(prevPostAgg?.fbImpressions || 0) +
+        Number(prevPostAgg?.igImpressions || 0);
+      const prevVideoViews =
+        Number(prevSnapAgg?.fbVideoViews || 0) +
+        Number(prevPostAgg?.igVideoViews || 0);
+      const prevPageViews = Number(prevSnapAgg?.pageViews || 0);
+      const prevMessages = Number(prevSnapAgg?.messages || 0);
+      const prevRevenue = Number(prevSnapAgg?.revenue || 0);
       const prevEngRate =
         prevImpressions > 0 ? (prevEngagements / prevImpressions) * 100 : 0;
 
@@ -609,6 +770,8 @@ export class AnalyticsController {
       if (!profileIds || profileIds.length === 0)
         return res.status(200).json([]);
 
+      const safeIds = profileIds.slice(0, MAX_PROFILE_IDS);
+
       let start: Date;
       let end: Date;
 
@@ -624,12 +787,13 @@ export class AnalyticsController {
 
       const posts = await this.postRepo.find({
         where: {
-          profileId: In(profileIds),
+          profileId: In(safeIds),
           postedAt: Between(start, end),
         },
         order: {
           postedAt: 'DESC',
         },
+        take: 1000,
       });
 
       return res.status(200).json(posts);
@@ -656,6 +820,7 @@ export class AnalyticsController {
         const latestSnapshot = await this.snapshotRepo.findOne({
           where: { profileId },
           order: { date: 'DESC' },
+          select: ['date'],
         });
 
         if (latestSnapshot) {

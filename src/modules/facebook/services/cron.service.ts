@@ -25,6 +25,18 @@ export class CronService {
       'Starting automated daily background sync for active profiles...',
     );
 
+    // Check if any sync jobs are currently active or waiting in the queue.
+    // If so, skip the entire daily sync to avoid interrupting ongoing imports.
+    const activeJobCount = await this.syncQueue.getActiveCount();
+    const waitingJobCount = await this.syncQueue.getWaitingCount();
+
+    if (activeJobCount > 0 || waitingJobCount > 0) {
+      this.logger.log(
+        `Skipping daily sync entirely — ${activeJobCount} active and ${waitingJobCount} waiting job(s) in queue (likely an ongoing import).`,
+      );
+      return;
+    }
+
     const activeProfiles = await this.profileRepo.find({
       where: { isActive: true },
     });

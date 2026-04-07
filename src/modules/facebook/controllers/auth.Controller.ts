@@ -113,6 +113,10 @@ export class AuthController {
           }
 
           if (needsSync) {
+            await this.profileRepo.update(
+              { profileId: profile.profileId },
+              { syncState: 'SYNCING' },
+            );
             await this.syncQueue.add(
               'initial-historical-sync',
               { profileId: profile.profileId },
