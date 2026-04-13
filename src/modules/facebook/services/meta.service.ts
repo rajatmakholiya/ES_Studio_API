@@ -545,10 +545,63 @@ async function fetchSegregatedRevenueChunk(
   untilUnix: number,
 ): Promise<SegregatedRevenueDay[]> {
 
-  // --- Attempt 1: content_monetization_earnings + breakdown=earning_source ---
-  // This is the primary source. Meta returns each value with an `earning_source`
-  // sibling field (Shape C): { value: 20.23, earning_source: "image", end_time: "..." }
-  // OR multiple data entries (Shape A), one per earning source.
+  // Helper: a breakdown response is only "useful" if it actually segregates
+  // revenue across at least one of photo/reel/story/text. If it's all dumped
+  // into `total` with zero per-type buckets, the API returned an aggregate-only
+  // response (wrong breakdown name, no permission, etc.) and we should try the
+  // next attempt instead of returning a useless all-zeros breakdown.
+  const isSegregated = (rows: SegregatedRevenueDay[]) =>
+    rows.some((r) => r.photo > 0 || r.reel > 0 || r.story > 0 || r.text > 0);
+
+  // --- Attempt 0.1: POST /{page_id}/content_monetization_earnings (direct edge) ---
+  // Per Meta v23 docs, the only valid breakdown for content_monetization_earnings
+  // at the page level is `earning_source` (NOT `content_type`).
+  try {
+    const url = `${BASE_URL}/${profileId}/content_monetization_earnings`;
+    const response = await axios.post(url, null, {
+      params: {
+        since: sinceUnix,
+        until: untilUnix,
+        period: 'day',
+        breakdown: 'earning_source',
+        access_token: accessToken,
+      }
+    });
+    const dataEntries = response.data?.data || (response.data ? [response.data] : []);
+    if (dataEntries.length > 0) {
+      const result = parseEarningSourceResponse(dataEntries);
+      if (result.length > 0 && isSegregated(result)) {
+         console.log(`[Meta API] Segregated breakdown parsed for ${profileId}: ${result.length} days (Attempt 0.1 POST)`);
+         return result;
+      }
+    }
+  } catch (err: any) {
+    console.warn(`[Meta API] Attempt 0.1 (POST direct edge) failed for ${profileId}:`, err.response?.data?.error?.message || err.message);
+  }
+
+  // --- Attempt 0.2: GET /{page_id}/content_monetization_earnings (direct edge) ---
+  try {
+    const url = `${BASE_URL}/${profileId}/content_monetization_earnings` +
+                `?since=${sinceUnix}&until=${untilUnix}&period=day&breakdown=earning_source&access_token=${accessToken}`;
+
+    const response = await axios.get(url);
+    const dataEntries = response.data?.data || (response.data ? [response.data] : []);
+    if (dataEntries.length > 0) {
+      const result = parseEarningSourceResponse(dataEntries);
+      if (result.length > 0 && isSegregated(result)) {
+         console.log(`[Meta API] Segregated breakdown parsed for ${profileId}: ${result.length} days (Attempt 0.2 GET)`);
+         return result;
+      }
+    }
+  } catch (err: any) {
+    console.warn(`[Meta API] Attempt 0.2 (GET direct edge) failed for ${profileId}:`, err.response?.data?.error?.message || err.message);
+  }
+
+  // --- Attempt 1: insights?metric=content_monetization_earnings&breakdown=earning_source ---
+  // Primary source for accurate segmentation. Meta returns each value with an
+  // `earning_source` sibling field (Shape C):
+  //   { value: 20.23, earning_source: "image", end_time: "..." }
+  // OR multiple data entries (Shape A), one per earning_source.
   try {
     const url =
       `${BASE_URL}/${profileId}/insights` +
@@ -561,16 +614,14 @@ async function fetchSegregatedRevenueChunk(
     const dataEntries = response.data?.data || [];
 
     if (dataEntries.length > 0) {
-      // Log for diagnostics
       if (dataEntries[0]?.values?.length > 0) {
         console.log(
-          `[Meta API] content_monetization_earnings+earning_source: ${dataEntries.length} entries, sample value: ${JSON.stringify(dataEntries[0].values[0]).slice(0, 500)}`,
+          `[Meta API] content_monetization_earnings+earning_source: ${dataEntries.length} entries, sample: ${JSON.stringify(dataEntries[0].values[0]).slice(0, 400)}`,
         );
       }
 
-      // Try parsing — handles Shape A (multiple entries) and Shape C (earning_source field)
       const result = parseEarningSourceResponse(dataEntries);
-      if (result.length > 0) {
+      if (result.length > 0 && isSegregated(result)) {
         console.log(
           `[Meta API] Segregated breakdown parsed for ${profileId}: ${result.length} days (Attempt 1)`,
         );
@@ -606,9 +657,10 @@ async function fetchSegregatedRevenueChunk(
       }
 
       // This metric returns monetization_tool (e.g. "content_monetization") not content type.
-      // Still parse it — if there are multiple tools we can get SOME segregation.
+      // Only use it if the parse actually yielded per-type segregation —
+      // otherwise fall through so Attempt 3 can return a clean total.
       const result = parseEarningSourceResponse(dataEntries);
-      if (result.length > 0) return result;
+      if (result.length > 0 && isSegregated(result)) return result;
     }
   } catch (err: any) {
     console.warn(
@@ -686,13 +738,19 @@ function parseEarningSourceResponse(dataEntries: any[]): SegregatedRevenueDay[] 
   const dayMap = new Map<string, SegregatedRevenueDay>();
 
   for (const entry of dataEntries) {
+    // Determine if it's a flat array of values or nested under .values
+    const valuesArray = (entry.values && Array.isArray(entry.values)) ? entry.values : [entry];
+
     // Shape A: entry-level label (used when there are multiple entries)
     const entryLabel = (
       entry.title || entry.name || entry.description || entry.id || ''
     ).toLowerCase();
 
-    for (const val of entry.values || []) {
-      const actualDate = new Date(val.end_time);
+    for (const val of valuesArray) {
+      if (val.value === undefined || (!val.end_time && !val.time && !val.date)) continue;
+      
+      const timeStr = val.end_time || val.time || val.date;
+      const actualDate = new Date(timeStr);
       actualDate.setDate(actualDate.getDate() - 1);
       const dateStr = actualDate.toISOString().split('T')[0];
       const amount = toDollars(val.value);
@@ -705,10 +763,10 @@ function parseEarningSourceResponse(dataEntries: any[]): SegregatedRevenueDay[] 
       const day = dayMap.get(dateStr)!;
 
       // Determine the content-type label.
-      // Shape C: use the `earning_source` or `monetization_tool` sibling field.
+      // Shape C: use `content_type`, `earning_source` or `monetization_tool` sibling field.
       // Shape A: use the entry-level title/name.
       const sourceLabel = (
-        val.earning_source || val.monetization_tool || entryLabel || ''
+        val.content_type || val.earning_source || val.monetization_tool || entryLabel || ''
       ).toLowerCase();
 
       // Map the label to one of our canonical buckets and always accumulate
