@@ -384,15 +384,22 @@ export interface SegregatedRevenueDay {
 
 /**
  * Normalise the keys Meta returns for content-type earnings into our
- * five canonical buckets: bonus, photo, reel, story, text.
+ * five canonical buckets plus a `total`.
  *
- * Skips non-earning keys like `currency`.
+ * IMPORTANT: `bonus` is populated ONLY when Meta explicitly labels the
+ * amount as a bonus/extra/performance payout. Amounts from unrecognised
+ * labels (or total-only `microAmount`) are added to `total` only —
+ * never to `bonus`. This keeps `bonus` truthful (Meta's public API does
+ * not surface a "bonus" field for most pages, so it should be 0 unless
+ * Meta literally says so).
+ *
+ * Skips non-earning keys like `currency` / `end_time`.
  * Handles microAmount objects automatically.
  */
 function normaliseCMPValue(raw: Record<string, any>): {
-  bonus: number; photo: number; reel: number; story: number; text: number;
+  bonus: number; photo: number; reel: number; story: number; text: number; total: number;
 } {
-  let bonus = 0, photo = 0, reel = 0, story = 0, text = 0;
+  let bonus = 0, photo = 0, reel = 0, story = 0, text = 0, total = 0;
 
   for (const [rawKey, rawVal] of Object.entries(raw)) {
     const k = rawKey.toLowerCase();
@@ -403,7 +410,12 @@ function normaliseCMPValue(raw: Record<string, any>): {
     const v = toDollars(rawVal);
     if (v === 0) continue;
 
-    if (k.includes('bonus') || k.includes('extra'))                   bonus += v;
+    // Every earning amount contributes to `total` — regardless of
+    // whether we can classify it into a breakdown bucket.
+    total += v;
+
+    if (k.includes('bonus') || k.includes('extra') || k.includes('performance'))
+                                                                      bonus += v;
     else if (k.includes('reel'))                                      reel  += v;
     else if (k.includes('video') || k.includes('in_stream') || k.includes('in-stream'))
                                                                       reel  += v;
@@ -412,19 +424,14 @@ function normaliseCMPValue(raw: Record<string, any>): {
     else if (k.includes('photo') || k.includes('image'))              photo += v;
     else if (k.includes('text') || k.includes('short_form'))          text  += v;
     else if (k === 'microamount') {
-      // Single total from content_monetization_earnings (no breakdown) —
-      // the whole object is { currency, microAmount } representing a total.
-      // Put under bonus as fallback; this path is only hit when breakdown
-      // is not available and we can't split further.
-      bonus += v;
+      // Single-total response (no breakdown) — counted in `total` only.
     }
     else {
-      console.warn(`[Meta API] Unknown CMP earning type "${rawKey}" = ${v}`);
-      bonus += v;
+      console.warn(`[Meta API] Unknown CMP earning type "${rawKey}" = ${v} — counted in total only`);
     }
   }
 
-  return { bonus, photo, reel, story, text };
+  return { bonus, photo, reel, story, text, total };
 }
 
 /**
@@ -440,21 +447,21 @@ function parseSegregatedValues(values: any[]): SegregatedRevenueDay[] {
 
     const v = val.value;
 
-    // { currency: "USD", microAmount: N } — single total, not a breakdown
+    // { currency: "USD", microAmount: N } — single total, not a breakdown.
+    // Meta does not expose bonus in this shape, so bonus stays 0 — total only.
     if (v && typeof v === 'object' && 'microAmount' in v) {
       const n = toDollars(v);
-      out.push({ date: dateStr, bonus: n, photo: 0, reel: 0, story: 0, text: 0, total: n });
+      out.push({ date: dateStr, bonus: 0, photo: 0, reel: 0, story: 0, text: 0, total: n });
     }
     // Object with content-type keys (actual breakdown)
     else if (v && typeof v === 'object' && !Array.isArray(v)) {
       const parsed = normaliseCMPValue(v);
-      const total = parsed.bonus + parsed.photo + parsed.reel + parsed.story + parsed.text;
-      out.push({ date: dateStr, ...parsed, total });
+      out.push({ date: dateStr, ...parsed });
     }
-    // Plain number → already in dollars
+    // Plain number → already in dollars; single total, no breakdown available.
     else if (typeof v === 'number' || typeof v === 'string') {
       const n = Number(v) || 0;
-      out.push({ date: dateStr, bonus: n, photo: 0, reel: 0, story: 0, text: 0, total: n });
+      out.push({ date: dateStr, bonus: 0, photo: 0, reel: 0, story: 0, text: 0, total: n });
     }
   }
   return out;
@@ -641,9 +648,12 @@ async function fetchSegregatedRevenueChunk(
     `[Meta API] All segregated attempts failed for ${profileId}, using legacy total`,
   );
   const totalRevenue = await fetchDailyRevenue(profileId, accessToken, sinceUnix, untilUnix);
+  // Legacy fallback: we only have a single aggregate per day with no breakdown.
+  // Meta does not expose a bonus figure, so bonus MUST stay 0 — the unsegregated
+  // lump sum lives in `total` only.
   return totalRevenue.map((rv) => ({
     date: rv.date,
-    bonus: rv.revenue,
+    bonus: 0,
     photo: 0,
     reel: 0,
     story: 0,
@@ -701,10 +711,10 @@ function parseEarningSourceResponse(dataEntries: any[]): SegregatedRevenueDay[] 
         val.earning_source || val.monetization_tool || entryLabel || ''
       ).toLowerCase();
 
-      // Map the label to our 5 canonical buckets
+      // Map the label to one of our canonical buckets and always accumulate
+      // into day.total — unclassified umbrellas (e.g. "content_monetization")
+      // still count toward the true page total even if we can't split them.
       addAmountToBucket(day, sourceLabel, amount);
-
-      day.total = day.bonus + day.photo + day.reel + day.story + day.text;
     }
   }
 
@@ -723,30 +733,36 @@ function parseEarningSourceResponse(dataEntries: any[]): SegregatedRevenueDay[] 
 function addAmountToBucket(day: SegregatedRevenueDay, label: string, amount: number) {
   if (amount === 0) return;
 
+  // Every amount contributes to the page's total, even if we can't classify it.
+  // Meta's umbrella labels (e.g. "content_monetization") and unknown labels
+  // stay out of the per-type buckets but must still be counted in `total`.
+  day.total += amount;
+
   if (label.includes('bonus') || label.includes('extra') || label.includes('performance'))
                                                           day.bonus += amount;
   else if (label === 'reel' || label.includes('reel'))    day.reel  += amount;
   else if (label.includes('video') || label.includes('in_stream') || label.includes('in-stream'))
                                                           day.reel  += amount;
-  else if (label === 'image' || label.includes('photo') || label.includes('image'))
-                                                          day.photo += amount;
   else if (label.includes('photos, text') || label.includes('photo, text')) {
     // Meta sometimes groups "Photos, text & stories" as one label.
     // Assign to photo as primary bucket.
     day.photo += amount;
   }
+  else if (label === 'image' || label.includes('photo') || label.includes('image'))
+                                                          day.photo += amount;
   else if (label.includes('story') || label.includes('stories'))
                                                           day.story += amount;
   else if (label === 'text' || label.includes('text') || label.includes('short_form'))
                                                           day.text  += amount;
   else if (label.includes('content_monetization')) {
-    // monetization_tool="content_monetization" — this is the umbrella tool, not a content type.
-    // Treat as bonus (total CMP earnings without content-type split).
-    day.bonus += amount;
+    // monetization_tool="content_monetization" — this is the umbrella tool,
+    // NOT a content type and NOT a bonus. Meta does not expose a bonus figure.
+    // Leave it in `total` only; it's an unsegregated lump sum.
   }
   else {
-    console.warn(`[Meta API] Unknown earning source "${label}" = $${amount.toFixed(4)}, adding to bonus`);
-    day.bonus += amount;
+    // Unknown label — keep in total only. Do NOT dump into bonus, because
+    // Meta's API does not actually report a bonus figure.
+    console.warn(`[Meta API] Unknown earning source "${label}" = $${amount.toFixed(4)} — counted in total only`);
   }
 }
 

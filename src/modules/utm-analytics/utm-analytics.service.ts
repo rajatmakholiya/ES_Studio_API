@@ -330,7 +330,12 @@ export class AnalyticsService {
     return totalInserted;
   }
 
-  @Cron('30 13 * * *', { timeZone: 'Asia/Kolkata' })
+  // Runs at 7:00 PM IST daily, in sync with the email-report cron.
+  // NOTE: this fires at the same minute as EmailReportsService.handleDailyReport,
+  // so the report may still pick up the PREVIOUS day's sync. If you want the
+  // 7 PM email to include data from this run, move this a few minutes earlier
+  // (e.g. `'45 18 * * *'`) so the sync finishes before the report is generated.
+  @Cron('0 19 * * *', { timeZone: 'Asia/Kolkata' })
   async scheduledSync() {
     await this.syncBigQueryData(false);
   }
