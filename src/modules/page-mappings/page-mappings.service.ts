@@ -12,7 +12,18 @@ export class PageMappingsService {
     private mappingRepository: Repository<PageMapping>,
   ) {}
 
-  findAll() {
+  async findAll() {
+    // One-shot cleanup: normalise any empty-string team values to NULL.
+    // Previous frontend code sometimes sent "" or undefined instead of null,
+    // leaving rows that look "assigned" but group separately from real nulls.
+    await this.mappingRepository
+      .createQueryBuilder()
+      .update()
+      .set({ team: null })
+      .where("team = ''")
+      .orWhere("TRIM(team) = ''")
+      .execute();
+
     return this.mappingRepository.find({
       order: { category: 'ASC', pageName: 'ASC' },
     });
@@ -24,6 +35,14 @@ export class PageMappingsService {
   }
 
   async update(id: number, partial: Partial<PageMapping>) {
+    // Normalise the team value: empty strings, whitespace-only, and undefined
+    // should all be stored as null (= "Unassigned" in the UI).  Without this,
+    // TypeORM skips `undefined` fields entirely (no DB write) and stores `""`
+    // as a non-null string that doesn't group with null.
+    if ('team' in partial) {
+      const t = partial.team;
+      partial.team = (typeof t === 'string' && t.trim()) ? t.trim() : null;
+    }
     await this.mappingRepository.update(id, partial);
     return this.mappingRepository.findOneBy({ id });
   }

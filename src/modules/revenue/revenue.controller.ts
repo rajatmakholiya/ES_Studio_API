@@ -18,6 +18,23 @@ export class RevenueController {
         return this.revenueService.getMappings();
     }
 
+    /**
+     * Batch-update the team for multiple revenue-mapping IDs at once.
+     * Body: { ids: number[], team: string | null }
+     * Returns the full updated mappings list.
+     *
+     * MUST be declared BEFORE the :id route.
+     */
+    @Patch('mappings/batch/team')
+    async batchUpdateTeam(@Body() body: { ids: number[]; team: string | null }) {
+        const { ids, team } = body;
+        if (!Array.isArray(ids) || ids.length === 0) return this.revenueService.getMappings();
+        for (const id of ids) {
+            await this.revenueService.updateMappingTeam(id, team);
+        }
+        return this.revenueService.getMappings();
+    }
+
     @Patch('mappings/:id')
     async updateMapping(@Param('id') id: string, @Body() body: { team: string | null }) {
         return this.revenueService.updateMappingTeam(Number(id), body.team);

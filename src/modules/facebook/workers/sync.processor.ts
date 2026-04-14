@@ -374,14 +374,14 @@ export class SyncProcessor {
 
             await this.dailyRevenueRepo.upsert(payloads, ['pageId', 'date']);
 
-            // Also update the analytics_snapshots total revenue column
+            // Keep analytics_snapshots.revenue in sync (Reports page reads this).
+            // Always write — even when total is 0 — so stale/incorrect values
+            // from previous syncs get corrected.
             for (const day of segregated) {
-              if (day.total > 0) {
-                await this.snapshotRepo.update(
-                  { profileId: profile.profileId, date: day.date },
-                  { revenue: day.total },
-                );
-              }
+              await this.snapshotRepo.update(
+                { profileId: profile.profileId, date: day.date },
+                { revenue: day.total },
+              );
             }
 
             console.log(

@@ -29,6 +29,24 @@ export class PageMappingsController {
     return this.service.create(mapping);
   }
 
+  /**
+   * Batch-update the `team` field for multiple mapping IDs at once.
+   * Body: { ids: number[], team: string | null }
+   * Returns the full updated mappings list.
+   *
+   * MUST be declared BEFORE the `:id` routes so NestJS matches the literal
+   * path segment "batch" rather than treating it as a numeric :id param.
+   */
+  @Patch('batch/team')
+  async batchUpdateTeam(@Body() body: { ids: number[]; team: string | null }) {
+    const { ids, team } = body;
+    if (!Array.isArray(ids) || ids.length === 0) return this.service.findAll();
+    for (const id of ids) {
+      await this.service.update(id, { team });
+    }
+    return this.service.findAll();
+  }
+
   @Delete(':id')
   remove(@Param('id') id: string) {
     return this.service.remove(+id);
