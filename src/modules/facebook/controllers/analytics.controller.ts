@@ -96,7 +96,7 @@ export class AnalyticsController {
         });
       }
 
-      const safeIds = profileIds.slice(0, MAX_PROFILE_IDS);
+      const safeIds = profileIds;
 
       // Single query: get latest demographic per profile using DISTINCT ON
       const latestDemos: DemographicSnapshot[] = await this.demographicRepo
@@ -319,7 +319,7 @@ export class AnalyticsController {
       if (!profileIds || profileIds.length === 0)
         return res.status(200).json({ timeSeries: [], totals: null });
 
-      const safeIds = profileIds.slice(0, MAX_PROFILE_IDS);
+      const safeIds = profileIds;
 
       let currentEnd: Date;
       let currentStart: Date;
@@ -407,14 +407,6 @@ export class AnalyticsController {
         .getRawMany();
 
       // --- CURRENT PERIOD: Revenue from authoritative daily_revenue table ---
-      // Debug: log what IDs we're querying and what exists in daily_revenue
-      const allDrPageIds = await this.dailyRevenueRepo
-        .createQueryBuilder('dr')
-        .select('DISTINCT dr."pageId"', 'pageId')
-        .getRawMany();
-      console.log('[REVENUE DEBUG] safeIds sent by frontend:', safeIds);
-      console.log('[REVENUE DEBUG] all pageIds in daily_revenue:', allDrPageIds.map((r: any) => r.pageId));
-
       const currentRevenueAgg: { date: string; revenue: string }[] =
         await this.dailyRevenueRepo
           .createQueryBuilder('dr')
@@ -426,13 +418,10 @@ export class AnalyticsController {
           .groupBy(`to_char(dr.date, 'YYYY-MM-DD')`)
           .getRawMany();
 
-      console.log('[REVENUE DEBUG] currentRevenueAgg result:', currentRevenueAgg);
-
       const revenueByDate: Record<string, number> = {};
       for (const row of currentRevenueAgg) {
         revenueByDate[row.date] = Number(row.revenue) || 0;
       }
-      console.log('[REVENUE DEBUG] revenueByDate:', revenueByDate);
 
       // --- CURRENT PERIOD: Post aggregation at DB level (GROUP BY date) ---
       const currentPostAgg: {
@@ -755,9 +744,6 @@ export class AnalyticsController {
         return ((current - previous) / Math.abs(previous)) * 100;
       };
 
-      console.log('[REVENUE DEBUG] currentRevenue total:', currentRevenue, '| prevRevenue total:', prevRevenue);
-      console.log('[REVENUE DEBUG] timeSeries revenue values:', timeSeries.map((s: any) => ({ date: s.date, revenue: s.revenue })));
-
       return res.status(200).json({
         timeSeries,
         totals: {
@@ -810,7 +796,7 @@ export class AnalyticsController {
       if (!profileIds || profileIds.length === 0)
         return res.status(200).json([]);
 
-      const safeIds = profileIds.slice(0, MAX_PROFILE_IDS);
+      const safeIds = profileIds;
 
       let start: Date;
       let end: Date;
