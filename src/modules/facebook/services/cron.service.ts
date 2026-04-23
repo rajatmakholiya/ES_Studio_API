@@ -19,6 +19,11 @@ export class CronService {
     @InjectQueue('social-sync-queue') private syncQueue: Queue,
   ) {}
 
+  @Cron('0 16 * * *', { timeZone: 'Asia/Kolkata' })
+  async handleDailySync4PM() {
+    await this.handleDailySync();
+  }
+
   @Cron(CronExpression.EVERY_DAY_AT_MIDNIGHT)
   async handleDailySync() {
     this.logger.log(
